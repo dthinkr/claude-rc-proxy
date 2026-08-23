@@ -374,6 +374,59 @@ func stripModelSuffix(body io.ReadCloser) (io.ReadCloser, int, error) {
 	}{rest, body}, delta, nil
 }
 
+// ──────────────────── H2 控制请求的安全重放 ────────────────────
+//
+// Go 的 H2 Transport 会自动重试 peer PROTOCOL_ERROR / REFUSED_STREAM,但 POST
+// body 已经写出后必须有 GetBody 才能重放。没有它时,一条共享 H2 连接出错会让同
+// 连接上的 heartbeat 一起报 "cannot rewind body after connection loss"。
+//
+// 只给明确幂等、体积有界的控制请求补 GetBody。推理请求、worker events、注册和
+// 未知长度 body 一律不碰:重复发送有副作用的 POST 比偶发失败更危险。
+
+const replayableBodyLimit int64 = 1 << 20 // 1 MiB;正常 heartbeat 远小于这个值
+
+func isReplayableControlPost(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	path := r.URL.Path
+	if path == "/api/event_logging/v2/batch" {
+		return true
+	}
+	return strings.HasPrefix(path, "/v1/code/sessions/") &&
+		strings.HasSuffix(path, "/worker/heartbeat")
+}
+
+// makeReplayableControlBody 给安全的小 POST 设置 Body + GetBody。任何不确定情况
+// 都保持原始流语义;返回 true 仅表示已成功变成可重放请求。
+func makeReplayableControlBody(r *http.Request) bool {
+	if !isReplayableControlPost(r) || r.Body == nil || r.Body == http.NoBody ||
+		r.ContentLength <= 0 || r.ContentLength > replayableBodyLimit {
+		return false
+	}
+
+	original := r.Body
+	raw, err := io.ReadAll(io.LimitReader(original, replayableBodyLimit+1))
+	if err != nil || int64(len(raw)) > replayableBodyLimit {
+		// 已经读走的前缀必须塞回去,失败不能改变原请求的字节流。
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(raw), original), original}
+		return false
+	}
+	_ = original.Close()
+
+	body := append([]byte(nil), raw...)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	r.ContentLength = int64(len(body))
+	r.Header.Set("Content-Length", strconv.FormatInt(r.ContentLength, 10))
+	return true
+}
+
 // ──────────────────────── 反向代理:两条路由 ────────────────────────
 
 func newReverseProxy(minter *certMinter) *httputil.ReverseProxy {
@@ -423,6 +476,9 @@ func newReverseProxy(minter *certMinter) *httputil.ReverseProxy {
 			// 必须保持订阅身份,不能改道。
 			r.URL.Scheme, r.URL.Host = realURL.Scheme, realURL.Host
 			r.Host = anthropicHost
+			if makeReplayableControlBody(r) {
+				vlog("REPLAY %s %s", r.Method, truncate(path, 60))
+			}
 
 			// bootstrap 的响应我们要改(往里塞池内模型),所以必须拿到明文。
 			// 客户端自己带的 Accept-Encoding: gzip 会让 Transport 原样透传压缩字节,
