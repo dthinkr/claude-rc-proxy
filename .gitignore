@@ -1,0 +1,3 @@
+# 编译产物(go build 默认按模块名输出)
+/claude-rc-proxy
+/claude-rc-proxy-go
