@@ -23,8 +23,16 @@
 //
 // 设计上的取舍(都是有意的)
 // ──────────────────────────
-//   - **对客户端只协商 HTTP/1.1**(ALPN 不宣告 h2)。Claude Code 会自动降级,
-//     功能不受影响。换来少一整类 h2 + 流式的坑(之前被坑过)。对上游仍然走 h2。
+//   - **重启不能续上正在流式吐字的那一轮**。/v1/messages 是一条流,进程一死
+//     TCP 就 RST,那一轮已经结束。能做的是让 9801 **立刻又能接新 CONNECT**,
+//     这样老窗口不用关:RC 心跳自己重连,用户点 retry / 发下一条即通。
+//     做不到的是把已掐断的生成无缝接回去。
+//   - **客户端和对上游都走 HTTP/1.1**。对客户端 ALPN 不宣告 h2(Claude Code
+//     会自动降级)。对上游曾经 ForceAttemptHTTP2 想省连接,结果几十个 session
+//     的 RC 长轮询 / 心跳 / 日志复用到 Anthropic 的少数几条 H2 上;对端一发
+//     INTERNAL_ERROR,全体一起 timeout。2026-08-25 实测:进程生命周期内 383 次
+//     H2 INTERNAL_ERROR,卡死时段伴随 TLS handshake timeout 风暴。H1 下一条
+//     连接死只死自己,多几十条 TLS 比全员停摆便宜。
 //   - **非 api.anthropic.com 的 CONNECT 一律裸隧道对拷**,不解 TLS。
 //     这些流量我们既不看也不改,解了纯属浪费 —— 旧版一次会话白扛 1139 条这种连接。
 //   - **绝不整体读取请求体**。推理请求体是整个对话历史(实测有 4MB 的),
@@ -442,9 +450,10 @@ func newReverseProxy(minter *certMinter) *httputil.ReverseProxy {
 			MaxIdleConns:          512,
 			MaxIdleConnsPerHost:   128,
 			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   15 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
 			ExpectContinueTimeout: time.Second,
-			ForceAttemptHTTP2:     true, // 对上游用 h2,省连接
+			// 禁止上游 H2。省连接的代价是所有 session 共享故障域,见文件头。
+			ForceAttemptHTTP2: false,
 		},
 		Director: func(r *http.Request) {
 			path := r.URL.Path
