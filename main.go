@@ -622,6 +622,14 @@ type proxy struct {
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 明文 /healthz 只给本机 watchdog 用。Claude Code 走 CONNECT,不会打到这里。
+	// 必须在分流之前拦下来:否则旧逻辑会把它当控制面转给 api.anthropic.com。
+	if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok\n")
+		return
+	}
 	if r.Method == http.MethodConnect {
 		p.handleConnect(w, r)
 		return

@@ -4,10 +4,20 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 )
+
+func TestHealthzDoesNotProxy(t *testing.T) {
+	p := &proxy{rp: newReverseProxy(nil)}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
+		t.Fatalf("healthz = %d %q", rec.Code, rec.Body.String())
+	}
+}
 
 func testRequest(method, path, body string, contentLength int64) *http.Request {
 	return &http.Request{
