@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHealthzDoesNotProxy(t *testing.T) {
@@ -16,6 +19,36 @@ func TestHealthzDoesNotProxy(t *testing.T) {
 	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
 		t.Fatalf("healthz = %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOneShotListenerUnblocksAfterConnectionClose(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() { _ = clientConn.Close() })
+
+	listener := newOneShotListener(serverConn, serverConn.LocalAddr())
+	accepted, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("first Accept() error = %v", err)
+	}
+
+	secondAccept := make(chan error, 1)
+	go func() {
+		_, err := listener.Accept()
+		secondAccept <- err
+	}()
+
+	if err := accepted.Close(); err != nil {
+		t.Fatalf("accepted connection Close() error = %v", err)
+	}
+
+	select {
+	case err := <-secondAccept:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("second Accept() error = %v, want io.EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second Accept() stayed blocked after the accepted connection closed")
 	}
 }
 
@@ -71,7 +104,6 @@ func TestMakeReplayableControlBody(t *testing.T) {
 			if r.ContentLength != int64(len(want)) || r.Header.Get("Content-Length") != "28" {
 				t.Fatalf("wrong content length: field=%d header=%q", r.ContentLength, r.Header.Get("Content-Length"))
 			}
-
 			got, err := io.ReadAll(r.Body)
 			if err != nil || !bytes.Equal(got, want) {
 				t.Fatalf("first body = %q, %v; want %q", got, err, want)
