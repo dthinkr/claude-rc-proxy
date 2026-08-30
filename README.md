@@ -97,7 +97,7 @@ CC_INJECT_ALLOW='/compact'          # only this exact line is accepted
 ## Install
 
 ```sh
-git clone https://github.com/<you>/claude-code-auto-compactor
+git clone https://github.com/dthinkr/claude-code-auto-compactor
 cd claude-code-auto-compactor
 ./install.sh          # --shim-only to skip the compaction daemon
 ```
