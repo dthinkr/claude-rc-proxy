@@ -1,0 +1,222 @@
+#!/usr/bin/python3
+"""Give a Claude Code session a side channel into its stream-json stdin.
+
+The VS Code extension decides what to launch via the `claudeCode.claudeProcessWrapper`
+setting:
+
+    Dr($,Q){ let J = getConfig("claudeProcessWrapper"), X = <bundled binary>;
+             if (J) return { pathToClaudeCodeExecutable: J,
+                             executableArgs: X ? [X] : [] } }
+
+so with that setting present the extension runs us as
+
+    <this script> <real binary> <all the usual args...>
+
+We exec the real binary unchanged and do exactly one extra thing: feed its stdin from
+both our own stdin and a unix socket. stdout/stderr are inherited, so the extension's
+protocol is never touched.
+
+The socket lives at /tmp/cc-inject/<child pid>.sock. That pid is the same one recorded
+in ~/.claude/sessions/<pid>.json, so a supervisor can map session name -> port.
+
+Writing a line of text into the socket is equivalent to typing that line into the
+composer and pressing enter, slash commands included: a stream-json user message has no
+`origin` field, and Claude Code treats a missing origin as human.
+
+The port is opened only when `--input-format stream-json` is present, so a terminal-mode
+launch passes straight through.
+
+Environment:
+  CC_INJECT_ALLOW   comma-separated whitelist of accepted lines. Unset (default) accepts
+                    anything. Set it to e.g. "/compact" to make the channel single-purpose.
+  CC_INJECT_DIR     socket directory (default /tmp/cc-inject)
+"""
+import glob
+import json
+import os
+import platform
+import signal
+import socket
+import sys
+import threading
+import uuid
+
+SOCK_DIR = os.environ.get("CC_INJECT_DIR", "/tmp/cc-inject")
+EXT_GLOB = os.path.expanduser("~/.vscode/extensions/anthropic.claude-code-*")
+ALLOW = [s.strip() for s in os.environ.get("CC_INJECT_ALLOW", "").split(",") if s.strip()]
+
+
+def find_bundled_binary():
+    """Locate a Claude Code binary ourselves, mirroring the extension's own lookup order."""
+    tag = f"{sys.platform}-{platform.machine()}"
+    cands = []
+    for ext in glob.glob(EXT_GLOB):
+        cands.append(os.path.join(ext, "resources", "native-binaries", tag, "claude"))
+        cands.append(os.path.join(ext, "resources", "native-binary", "claude"))
+    # Directory names carry the version, so the lexicographic max is the newest.
+    for path in sorted(cands, reverse=True):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def resolve_target(argv):
+    """argv[1] is the real binary and the rest are its arguments -- normally.
+
+    If the extension ever changes that convention (or fails to find its own bundled
+    binary, in which case executableArgs is empty), argv[1] is just another flag. Find a
+    binary ourselves rather than dying: losing the side channel is acceptable, failing to
+    start the session is not. This code sits in the launch path of every session.
+    """
+    if len(argv) >= 2 and os.path.isfile(argv[1]) and os.access(argv[1], os.X_OK):
+        return argv[1], argv[2:]
+    fallback = find_bundled_binary()
+    if fallback:
+        sys.stderr.write(f"cc-stdin-shim: argv[1] is not executable "
+                         f"({argv[1] if len(argv) > 1 else '(none)'}); "
+                         f"falling back to {fallback}\n")
+        return fallback, argv[1:]
+    return None, None
+
+
+def main():
+    real, args = resolve_target(sys.argv)
+    if real is None:
+        sys.stderr.write("cc-stdin-shim: no runnable claude binary found. "
+                         "Remove claudeCode.claudeProcessWrapper from your VS Code "
+                         "settings to restore normal launching.\n")
+        return 2
+
+    streaming = False
+    for i, a in enumerate(args):
+        if a == "--input-format" and i + 1 < len(args) and args[i + 1] == "stream-json":
+            streaming = True
+        elif a == "--input-format=stream-json":
+            streaming = True
+
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.dup2(r_fd, 0)
+        os.close(r_fd)
+        os.close(w_fd)
+        os.execv(real, [real] + args)
+        os._exit(127)
+
+    os.close(r_fd)
+    lock = threading.Lock()
+    stop = threading.Event()
+    sock_path = os.path.join(SOCK_DIR, f"{pid}.sock")
+
+    def feed(data):
+        """Write one chunk to the child's stdin atomically with respect to other writers."""
+        with lock:
+            try:
+                os.write(w_fd, data)
+                return True
+            except OSError:
+                return False
+
+    def pump_stdin():
+        """Extension -> child. EOF is the extension's shutdown signal; pass it on."""
+        while True:
+            try:
+                chunk = os.read(0, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            if not feed(chunk):
+                break
+        stop.set()
+        with lock:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+
+    def serve_socket():
+        try:
+            os.makedirs(SOCK_DIR, mode=0o700, exist_ok=True)
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(sock_path)
+            os.chmod(sock_path, 0o600)
+            srv.listen(4)
+            srv.settimeout(1.0)
+        except OSError as exc:
+            sys.stderr.write(f"cc-stdin-shim: could not open side channel ({exc}); "
+                             f"session is unaffected\n")
+            return
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                try:
+                    conn.settimeout(5.0)
+                    buf = b""
+                    while b"\n" not in buf and len(buf) < 65536:
+                        part = conn.recv(4096)
+                        if not part:
+                            break
+                        buf += part
+                    text = buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+                    if not text:
+                        continue
+                    if ALLOW and text not in ALLOW:
+                        conn.sendall(b"refused\n")
+                        continue
+                    line = json.dumps({
+                        "type": "user",
+                        "uuid": str(uuid.uuid4()),
+                        "message": {"role": "user",
+                                    "content": [{"type": "text", "text": text}]},
+                    }) + "\n"
+                    conn.sendall(b"ok\n" if feed(line.encode()) else b"closed\n")
+                except OSError:
+                    pass
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+
+    def forward(signum, _frame):
+        try:
+            os.kill(pid, signum)
+        except OSError:
+            pass
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+        try:
+            signal.signal(sig, forward)
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=pump_stdin, daemon=True).start()
+    if streaming:
+        threading.Thread(target=serve_socket, daemon=True).start()
+
+    while True:
+        try:
+            _, status = os.waitpid(pid, 0)
+            break
+        except InterruptedError:
+            continue
+    stop.set()
+    # The accept loop is a daemon thread and dies with the process, too late to clean up.
+    try:
+        os.unlink(sock_path)
+    except OSError:
+        pass
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return os.WEXITSTATUS(status)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
