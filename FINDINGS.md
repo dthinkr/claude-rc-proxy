@@ -184,11 +184,12 @@ ephemeral_1h_input_tokens: 1690864632
 ephemeral_5m_input_tokens: 0
 ```
 
-Every published keepalive tool hardcodes 300s. On a 1-hour tier that is wrong by an order of
+The three keepalive tools I found all hardcode 300s. On a 1-hour tier that is wrong by an order of
 magnitude, and it is what makes a ~50-minute window correct here instead of ~4 minutes.
 
-**[binary]** `overage state changed (TTL flip expected)` — entering usage overage drops you to the
-5-minute tier, so a rule that pins the tier at startup can silently become wrong.
+**[binary]** `overage state changed (TTL flip expected)` — entering usage overage flips the tier. The
+string proves a flip is expected; it does not by itself prove the destination is the 5-minute tier.
+Either way, a rule that pins the tier at startup can silently become wrong.
 
 ## 6. `precomputeCompactionEnabled` — a real, gated, adjacent feature
 

@@ -3,13 +3,16 @@
 
 Rule: fire when idle time is in [T_IDLE_MIN, T_IDLE_MAX) and context >= T_CTX.
 
-The upper bound is not optional. On a 1-hour cache tier (write 2.0x, read 0.1x):
+The upper bound matters. On a 1-hour cache tier (write 2.0x, read 0.1x):
 
     do nothing              user pays 2.0 * C when they come back
     compact while cold      the summary itself pays 2.0 * C, and then 2.0 * C' on top
 
-so compacting a cold session is strictly worse than leaving it alone. Once the window
-has passed, the right move is to do nothing.
+So for the act of resuming, compacting cold costs more than leaving the session alone.
+Over a longer horizon it can still pay off -- each later warm turn saves 0.1 * (C - C'),
+recovering the extra 2.0 * C' after roughly six more turns -- but an idle session gives no
+signal about whether those turns are coming, and compaction also costs conversation
+detail. So past the window this daemon declines the bet and does nothing.
 
 Delivery uses the side channel opened by shim/cc-stdin-shim at
 /tmp/cc-inject/<pid>.sock. Sessions started before the shim was installed have no port;
@@ -24,6 +27,7 @@ import os
 import socket
 import sys
 import time
+from datetime import datetime
 
 # All three thresholds can be overridden, which is how you exercise the whole path
 # without waiting an hour.
@@ -31,8 +35,10 @@ T_IDLE_MIN = int(os.environ.get("CC_COMPACT_IDLE_MIN", 50 * 60))
 T_IDLE_MAX = int(os.environ.get("CC_COMPACT_IDLE_MAX", 58 * 60))
 T_CTX = int(os.environ.get("CC_COMPACT_CTX", 450_000))
 # Defaults: before 50 min the cache is still hot and the user is likely to return;
-#           after 58 min the cache is about to expire and compacting costs more than
-#           doing nothing; below 450k the saved 2.0*(C-C') does not justify the lost detail.
+#           after 58 min the cache is close enough to expiry that the summary may pay a
+#           full cold rebuild; below 450k the saved 2.0*(C-C') does not justify the lost
+#           detail. Idle is measured from the last API response, so a long generation eats
+#           into the margin -- which is part of why the window stops short of 60 min.
 
 SESSIONS = os.path.expanduser("~/.claude/sessions")
 PROJECTS = os.path.expanduser("~/.claude/projects")
@@ -84,8 +90,23 @@ def transcript_for(session_id):
     return max(hits, key=os.path.getmtime) if hits else None
 
 
-def context_tokens(path):
-    """Current context size, read from the tail of the transcript.
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+def read_tail(path):
+    """Return (context_tokens, timestamp of the last real API request).
+
+    Idle time must be measured from the last request, not from the file's mtime:
+    `queue-operation`, `bridge-session` and `last-prompt` entries touch the transcript
+    without any API call, so mtime can say "active" for a session whose cache is old.
+
+    Note this is still the *completion* time of that request. A long generation runs the
+    cache clock while producing nothing new to anchor on, so it eats into the margin --
+    which is why the window stops well short of the TTL.
 
     Sidechain entries belong to subagents and do not count toward the main thread.
     """
@@ -95,7 +116,7 @@ def context_tokens(path):
             fh.seek(max(0, size - TAIL_BYTES))
             chunk = fh.read()
     except OSError:
-        return None
+        return None, None
     lines = chunk.split(b"\n")
     if size > TAIL_BYTES:
         lines = lines[1:]                      # first line is probably truncated
@@ -110,16 +131,17 @@ def context_tokens(path):
         # last one still shows the pre-compaction size. Whichever is nearer the tail wins.
         cm = o.get("compactMetadata")
         if cm and cm.get("postTokens") is not None:
-            return cm["postTokens"]
+            return cm["postTokens"], parse_ts(o.get("timestamp"))
         if o.get("type") != "assistant" or o.get("isSidechain"):
             continue
         u = (o.get("message") or {}).get("usage")
         if not u:
             continue
-        return (u.get("input_tokens", 0)
-                + u.get("cache_creation_input_tokens", 0)
-                + u.get("cache_read_input_tokens", 0))
-    return None
+        ctx = (u.get("input_tokens", 0)
+               + u.get("cache_creation_input_tokens", 0)
+               + u.get("cache_read_input_tokens", 0))
+        return ctx, parse_ts(o.get("timestamp"))
+    return None, None
 
 
 def inject(pid, text):
@@ -153,12 +175,16 @@ def scan():
         tp = transcript_for(sid)
         if tp is None:
             continue
-        try:
-            idle = now - os.path.getmtime(tp)
-        except OSError:
-            continue
+        ctx, last_req = read_tail(tp)
+        if last_req is None:
+            try:
+                last_req = os.path.getmtime(tp)     # fall back if timestamps are missing
+            except OSError:
+                continue
+        idle = now - last_req
         out.append({"name": d.get("name") or sid[:8], "pid": pid, "sid": sid,
-                    "started": d.get("startedAt", 0), "twins": [],
+                    "started": d.get("startedAt", 0), "twins": [], "ctx": ctx,
+                    "last_req": last_req,
                     "cwd": d.get("cwd", ""), "transcript": tp, "idle": idle,
                     "sock": os.path.exists(os.path.join(SOCK_DIR, f"{pid}.sock"))})
 
@@ -190,7 +216,7 @@ def cmd_status():
         print("daemon has not run yet -- launchctl list | grep claude-auto-compact")
     print(f"{'session':<26}{'idle':>8}{'context':>12}  port  verdict")
     for r in sorted(rows, key=lambda x: -x["idle"]):
-        ctx = context_tokens(r["transcript"])
+        ctx = r["ctx"]
         ent = st.get(r["sid"], {})
         if not r["sock"]:
             note = "no shim (restart this session)"
@@ -222,7 +248,7 @@ def cmd_run(dry):
 
     fired = 0
     for r in rows:
-        ctx = context_tokens(r["transcript"])
+        ctx = r["ctx"]
         if ctx is None:
             continue
         ent = st.setdefault(r["sid"], {"armed": True})
@@ -244,11 +270,9 @@ def cmd_run(dry):
             continue
 
         # Re-check immediately before sending, in case the user just came back.
-        try:
-            if time.time() - os.path.getmtime(r["transcript"]) < T_IDLE_MIN:
-                log(f"skipping {r['name']}: activity detected just before sending")
-                continue
-        except OSError:
+        _ctx, fresh = read_tail(r["transcript"])
+        if fresh is not None and time.time() - fresh < T_IDLE_MIN:
+            log(f"skipping {r['name']}: activity detected just before sending")
             continue
 
         if dry:

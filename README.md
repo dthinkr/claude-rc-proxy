@@ -1,17 +1,17 @@
 # claude-code-auto-compactor
 
-**A supported way to drive a running Claude Code session from an external process — and an idle
-auto-compactor built on top of it.**
+**Drive a running Claude Code session from an external process, using the extension's own
+launch hook — and an idle auto-compactor built on top of it.**
 
 Two things live here:
 
-1. **`shim/cc-stdin-shim`** — a ~170-line wrapper that gives every VS Code Claude Code session a
+1. **`shim/cc-stdin-shim`** — a ~180-line wrapper that gives every VS Code Claude Code session a
    side channel at `/tmp/cc-inject/<pid>.sock`. Write a line of text into it and the session
    behaves exactly as if you had typed that line into the composer and pressed enter — slash
    commands included.
 2. **`compactd.py`** — the reference consumer. It watches for sessions that have gone idle while
-   holding a large context and sends them `/compact` **while the prompt cache is still warm**, so
-   coming back tomorrow does not pay for a cold rebuild of the whole conversation.
+   holding a large context and sends them `/compact` **while the prompt cache is very likely still
+   warm**, so coming back tomorrow does not pay for a cold rebuild of the whole conversation.
 
 If you only want #1, ignore `compactd.py`. The shim is independent and has no idea what it is
 carrying.
@@ -20,8 +20,7 @@ carrying.
 
 ## Why the side channel exists
 
-Claude Code deliberately wraps or strips the leading slash on *every* input path that is not a
-human typing:
+Claude Code wraps or strips the leading slash on *every* input path that is not a human typing:
 
 | Path | What arrives |
 |---|---|
@@ -31,8 +30,13 @@ human typing:
 
 The gate is one predicate — roughly
 `value.trim().startsWith("/") && !skipSlashCommands` — and every wrapper above is enough to make
-it fail. That is intentional, not an oversight, and there is no supported programmatic trigger for
-`/compact` (the SDK `control_request` subtype whitelist has no compaction entry).
+it fail. Whatever the reason, it is consistent across all of them, and there is no documented
+programmatic trigger for `/compact` (the SDK `control_request` subtype whitelist has no compaction
+entry).
+
+One caveat on what is and is not sanctioned: `claudeCode.claudeProcessWrapper` is a documented
+extension setting, but *missing-origin-counts-as-human* is undocumented internal behaviour that
+could change in any release.
 
 What is *not* closed is the session's own stdin. The VS Code extension does not run the CLI in a
 terminal; it runs it with `--input-format stream-json` over a socketpair:
@@ -111,6 +115,48 @@ macOS only, and VS Code only. A terminal `claude` never goes through the extensi
 is a tty rather than stream-json; `TIOCSTI` — the one candidate for injecting into a tty — returns
 `EPERM` on current macOS, so terminal sessions have no equivalent channel.
 
+## Why this saves anything
+
+Claude re-reads the whole conversation every time you send a message. To stop that costing a
+fortune, the conversation is kept as a **warm copy** — reading from it costs about a twentieth of
+what building it costs. The warm copy is discarded after an hour of silence, and the next message
+has to build a fresh one, at full price, for however large the conversation has grown.
+
+Compaction swaps the conversation for a summary — about a fifth of the size in practice. The whole
+question is *when* you do it:
+
+```
+  last turn                                                       cache expires
+      │                                                          │
+      ├───────────────── warm copy alive (1 h) ──────────────────┤─────────►
+      │                                ▲                         │
+      │                        ┌───────┴────────┐                │
+      │                        │  compact here  │                │
+      │                        │  50 - 58 min   │                │
+      │                        └────────────────┘                │
+      │                                                          │
+      │  the summary reads the warm copy, so writing             │  the summary must
+      │  it is nearly free -- and the new warm copy              │  rebuild everything
+      │  it leaves behind is small                               │  first: full price
+```
+
+Same session, three choices. Real numbers from one 842k-token conversation that compacted to
+13.5k, counted in input-token equivalents:
+
+```
+  cost of picking that conversation back up tomorrow
+
+  do nothing            ████████████████████████████████████████   1,684k
+  compact while warm    ███                                          111k     ← 15x cheaper
+  compact once cold     ████████████████████████████████████████▏  1,711k
+                        └── rebuild you were trying to avoid ──┘
+```
+
+The middle bar is the point of the whole project. The bottom bar is why the rule has an upper
+bound as well as a lower one: once the warm copy is gone, compacting pays the expensive rebuild
+*and* leaves you a summary, which for the act of resuming is worse than having done nothing at
+all.
+
 ## The compaction rule
 
 Fire when idle time is in **`[50 min, 58 min)`** and context is **≥ 450k tokens**.
@@ -124,14 +170,22 @@ read `0.1x` of base input):
 | compact **while warm** | `0.1 · C` for the summary, then `2.0 · C′` |
 | compact **after the cache expired** | `2.0 · C` for the summary, *then* `2.0 · C′` |
 
-So compacting cold is **strictly worse than doing nothing** — you pay the full cold rebuild anyway
-and then pay again. Any "compact after N seconds idle" rule without an upper bound is
-negative-expected-value every time it fires late (laptop asleep, daemon restarted, machine
-suspended). Past the window, the right move is to leave the session alone.
+So compacting cold costs **more than doing nothing** for the return itself: you pay the full cold
+rebuild for the summarization request, and then pay again for the new prefix. Any "compact after N
+seconds idle" rule with no upper bound eats that cost every time it fires late — laptop asleep,
+daemon restarted, tick missed.
 
-The lower bound and the context floor come from measurement, not taste. Backtesting every
-transcript under `~/.claude/projects` (`analyze_sessions.py`), the probability that a session is
-used again after going quiet rises monotonically with how much context it was holding:
+It is worth being precise about the horizon. That comparison is about the cost of *resuming*. If
+the session then keeps going, each later warm turn saves `0.1 · (C − C′)`, so the extra `2.0 · C′`
+is recovered after roughly six more turns. Cold compaction is therefore a bad bet, not a
+catastrophe: it loses if the user does a little work and leaves, and wins if they settle in. Since
+an idle session gives no signal about which of those is coming, and compaction also costs
+conversation detail, this daemon declines the bet and does nothing past the window.
+
+The lower bound and the context floor come from measurement, not taste — though it is one
+person's measurement. Backtesting every transcript under `~/.claude/projects`
+(`analyze_sessions.py`, 168 sessions over 45 days on a single machine), the probability that a
+session is used again after going quiet rises monotonically with how much context it was holding:
 
 | context when it went quiet | came back |
 |---|---|
@@ -140,8 +194,9 @@ used again after going quiet rises monotonically with how much context it was ho
 | 250–500k | 91.7% |
 | > 500k | 97.5% |
 
-Context size is therefore its own predictor — no per-session behavioural model is needed. Measured
-compaction ratio across 142 real compactions: `C′/C = 0.203` (median).
+On this data context size is its own predictor, so no per-session behavioural model was needed;
+whether that holds for a different working style is untested. Measured compaction ratio across 142
+real compactions: `C′/C = 0.203` (median).
 
 **Compaction is not free in the other direction.** You trade conversation detail for the summary.
 That is why the floor is 450k rather than as low as the economics alone would allow.

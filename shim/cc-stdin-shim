@@ -97,20 +97,30 @@ def main():
     r_fd, w_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
-        os.dup2(r_fd, 0)
-        os.close(r_fd)
-        os.close(w_fd)
-        os.execv(real, [real] + args)
+        try:
+            os.dup2(r_fd, 0)
+            os.close(r_fd)
+            os.close(w_fd)
+            os.execv(real, [real] + args)
+        except BaseException:                  # noqa: BLE001 - must not unwind in a fork
+            pass
+        # Never let the interpreter unwind here: this is a forked child sharing the
+        # parent's inherited stderr and atexit handlers.
         os._exit(127)
 
     os.close(r_fd)
     lock = threading.Lock()
     stop = threading.Event()
+    closed = False
     sock_path = os.path.join(SOCK_DIR, f"{pid}.sock")
 
     def feed(data):
         """Write one chunk to the child's stdin atomically with respect to other writers."""
         with lock:
+            # Once w_fd is closed its number can be reused by an unrelated open, so a
+            # late write must be refused rather than merely caught.
+            if closed:
+                return False
             try:
                 os.write(w_fd, data)
                 return True
