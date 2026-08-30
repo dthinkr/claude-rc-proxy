@@ -192,8 +192,8 @@ func TestDirectorAddsReplayOnlyToDirectAllowlist(t *testing.T) {
 		"/v1/code/sessions/cse_123/worker/heartbeat",
 		heartbeatBody, int64(len(heartbeatBody)))
 	rp.Director(heartbeat)
-	if heartbeat.URL.Scheme != "https" || heartbeat.URL.Host != anthropicHost || heartbeat.GetBody == nil {
-		t.Fatalf("heartbeat route/replay wrong: url=%s getBody=%v", heartbeat.URL.String(), heartbeat.GetBody != nil)
+	if heartbeat.URL.Scheme != "https" || heartbeat.URL.Host != anthropicHost || heartbeat.GetBody == nil || !heartbeat.Close {
+		t.Fatalf("heartbeat route/replay/close wrong: url=%s getBody=%v close=%v", heartbeat.URL.String(), heartbeat.GetBody != nil, heartbeat.Close)
 	}
 
 	messageBody := `{"model":"test","messages":[]}`

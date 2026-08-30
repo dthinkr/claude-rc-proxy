@@ -531,6 +531,10 @@ func newReverseProxy(minter *certMinter) *httputil.ReverseProxy {
 			// 必须保持订阅身份,不能改道。
 			r.URL.Scheme, r.URL.Host = realURL.Scheme, realURL.Host
 			r.Host = anthropicHost
+			// RC 长轮询经常被客户端取消。复用这类上游 H1 连接会逐渐污染
+			// Transport:新控制面请求收不到响应,而直连 Anthropic 仍正常。
+			// 每条控制面请求结束就关连接;推理仍复用便宜的 localhost:8317。
+			r.Close = true
 			if makeReplayableControlBody(r) {
 				vlog("REPLAY %s %s", r.Method, truncate(path, 60))
 			}
