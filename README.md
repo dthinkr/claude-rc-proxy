@@ -36,23 +36,78 @@ question is *when*:
       │  it leaves behind is small                               │  first: full price
 ```
 
-Real numbers from one 842k-token conversation that compacted to 13.5k, in input-token
-equivalents:
+Avoiding that one cold rebuild is the obvious win, and it is **not the big one**. The bigger term
+is the read tax: after compaction *every* later turn reads a fifth as much, and that accrues per
+turn for the rest of the session. On the workload measured below, cache reads alone were **52% of the
+bill**, against 37% for cache writes and 10% for output — so the term that scales with how big
+you let a context get is also the term that dominates.
 
+## What it's worth
+
+Replaying 1,179 local sessions turn by turn — 302,213 assistant turns over 30 days — and
+re-deciding at each idle window whether to compact:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="charts/savings-curve-dark.svg">
+  <img alt="Savings rise steeply from a 1M threshold down to about 500k, then flatten, while the number of compactions keeps climbing" src="charts/savings-curve-light.svg">
+</picture>
+
+| threshold | compactions / 30d | share of bill removed | marginal, per compaction |
+|---|---:|---:|---:|
+| 800k | 21 | 44.4% | $1,620 |
+| 500k | 44 | 55.6% | $354 |
+| 450k *(default)* | 53 | 57.6% | $166 |
+| 300k | 77 | 62.8% | $204 |
+| 200k | 127 | 66.5% | $58 |
+| 100k | 201 | 69.6% | $25 |
+| 50k | 266 | 70.4% | $6 |
+
+Two things to take from the curve. **Almost all of the money is in the first third of the
+descent** — going from no compaction to a 500k threshold captures 56 points with 44 compactions;
+grinding from 500k down to 50k adds 15 more and costs six times the interruptions. (The dip at
+600k in the figure is ordering noise, not a feature: compacting earlier changes which later
+windows still qualify, and at high thresholds there are too few events to average it out.) And **the
+marginal value per compaction collapses**, from $1,620 at 800k to under $60 below 200k, because
+you start compacting sessions that were never going to be expensive.
+
+The curve is that steep because spend is wildly concentrated: of 412 billable sessions, the top 5
+were **51% of the total** and the top 25 were 82%. The single most expensive session — 38,627
+turns — was a third of the month's bill on its own. High thresholds hit exactly those; low
+thresholds work the tail, and the tail is nearly free.
+
+If you only take one number: **anything above a 450k threshold is leaving real money on the
+table, and anything below 200k is buying single-digit dollars with a real interruption.**
+
+## When it fires
+
+Fire when idle is in **`[50 min, 58 min)`** and context is **≥ 450k**. The lower bound gets as
+close to cache expiry as polling allows; the upper bound refuses the bet once the cache is
+probably already gone.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="charts/idle-gaps-dark.svg">
+  <img alt="Most idle gaps are short, but one in five outlives the cache and pays a cold rebuild of about 320k tokens" src="charts/idle-gaps-light.svg">
+</picture>
+
+Every gap left of the marker resumes onto a live cache and rebuilds almost nothing. Right of it,
+the cache is certainly gone and the resuming turn pays ~320k tokens of cold rebuild — **21% of
+all idle gaps land there.** That is the population this daemon is aiming at.
+
+Two more numbers set the odds. A session that reaches 50 minutes idle comes back **50%** of the
+time (1,197 did, 1,213 never did). Of the ones that come back, **89% come back after the hour is
+up** — so when the bet pays, it nearly always pays the full cold rebuild, and when it loses, it
+loses only the price of reading a warm cache once (about $0.27 at a 300k context).
+
+The window assumes a 1-hour cache tier. **Check yours** — a 5-minute tier needs a much tighter
+one:
+
+```sh
+grep -ho '"ephemeral_[0-9]*[hm]_input_tokens":[0-9]*' ~/.claude/projects/*/*.jsonl \
+  | awk -F'[:"]' '{t[$2]+=$NF} END{for(k in t) print k, t[k]}'
 ```
-  cost of picking that conversation back up tomorrow
 
-  do nothing            ████████████████████████████████████████   1,684k
-  compact while warm    ███                                          111k     ← 15x cheaper
-  compact once cold     ████████████████████████████████████████▏  1,711k
-                        └── rebuild you were trying to avoid ──┘
-```
-
-The bottom bar is why the rule has an **upper** bound too. Compacting cold pays the expensive
-rebuild just to write the summary — for the act of resuming, worse than doing nothing. (Over a
-longer horizon it recovers: each later warm turn saves `0.1·(C−C′)`, clearing the extra `2.0·C′`
-after roughly six turns. It is a bad bet, not a disaster. An idle session gives no signal about
-whether those turns are coming, so past the window this daemon declines the bet.)
+Compaction also costs conversation detail, which is the other reason the floor is not lower —
+below 200k the money no longer argues for it and the lost detail still does.
 
 ## Install
 
@@ -66,26 +121,26 @@ It backs up and edits your VS Code user settings, writes a launchd plist, and lo
 **Sessions already running keep their old process** — restart one, then `./compactd.py --status`
 should show `yes` in the port column.
 
-## The rule
+All three bounds are environment variables, which is also how you exercise the whole path without
+waiting an hour:
 
-Fire when idle is in **`[50 min, 58 min)`** and context is **≥ 450k**. Both bounds and the floor
-are settable via `CC_COMPACT_IDLE_MIN` / `CC_COMPACT_IDLE_MAX` / `CC_COMPACT_CTX`, which is also
-how you exercise the whole path without waiting an hour.
+| variable | default | what it does |
+|---|---|---|
+| `CC_COMPACT_CTX` | `450000` | context floor that arms the daemon |
+| `CC_COMPACT_IDLE_MIN` | `3000` (50 min) | earliest it will fire |
+| `CC_COMPACT_IDLE_MAX` | `3480` (58 min) | past this, the bet is declined |
+| `CC_INJECT_ALLOW` | unset | restrict the channel to one exact command |
 
-The window assumes a 1-hour cache tier. **Check yours** — a 5-minute tier needs a much tighter
-one:
+To change them for the installed agent, add an `EnvironmentVariables` dict to
+`~/Library/LaunchAgents/com.claude-auto-compact.plist` and reload it — that keeps your tuning out
+of the code:
 
-```sh
-grep -ho '"ephemeral_[0-9]*[hm]_input_tokens":[0-9]*' ~/.claude/projects/*/*.jsonl \
-  | awk -F'[:"]' '{t[$2]+=$NF} END{for(k in t) print k, t[k]}'
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>CC_COMPACT_CTX</key><string>300000</string>
+</dict>
 ```
-
-The 450k floor is empirical but from one machine: backtesting 168 sessions over 45 days
-(`analyze_sessions.py`), the chance a session was used again after going quiet ran 67.5% below
-100k, 84.6% at 100–250k, 91.7% at 250–500k and 97.5% above 500k. Bigger context is its own
-predictor, so no behavioural model was needed — untested for other working styles. Measured
-compaction ratio across 142 real compactions: `C′/C = 0.203`. Compaction also costs conversation
-detail, which is the other reason the floor is not lower.
 
 ```sh
 compactd.py --status      # per-session verdict; first line is the daemon heartbeat
@@ -108,7 +163,28 @@ the real binary unchanged and multiplexes one socket into it. stdout/stderr are 
 untouched.
 
 [FINDINGS.md](FINDINGS.md) has the full record: the eight injection routes that *don't* work,
-`autoCompactWindow` and cache-tier semantics, and three measurement mistakes worth not repeating.
+`autoCompactWindow` and cache-tier semantics, the replay method behind the curve above and its
+three known biases, and measurement mistakes worth not repeating.
+
+## How the numbers were measured
+
+`replay.py` produces the curve and the table above; run it on your own transcripts before
+trusting either. It reads `~/.claude/projects/**/*.jsonl` and takes per-turn
+`input_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens` / `output_tokens`
+straight from the transcripts — no estimation. `analyze_sessions.py` answers the narrower per-event question, and `charts/make_charts.py`
+redraws the figures.
+
+Costs are Anthropic first-party list prices, cache writes billed at the 1-hour tier (2× input);
+free and gateway-routed models are excluded from dollar figures. The compaction ratio is the
+measured `C′/C = 0.203` across 142 real compactions.
+
+**This is one person's workload on one machine.** The shape of the curve should generalize — it
+comes from spend concentration, which is a property of how agentic sessions grow — but the
+thresholds are worth re-deriving on your own transcripts before trusting them. Three known biases,
+all small and all in the same direction: the replay only fires at windows where the session
+actually resumed, so it omits compactions wasted on sessions that never came back (~0.1% of the
+total); the summary is modelled at a flat 0.2× rather than per-session; and the baseline is real
+30-day spend that already contains a few days of the daemon running.
 
 ## Caveats
 

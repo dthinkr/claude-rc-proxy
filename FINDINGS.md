@@ -320,3 +320,47 @@ input, my driver waited for `result` before sending the second message — but `
 held by the hook, so the second message went out *after* the hook woke, measuring 1.5s and looking
 fine. Firing it on a timer instead gave the real answer: **36.3s blocked**. A 50-minute sleep would
 make a returning user wait 45 minutes. The timer has to live outside the session.
+
+## Measuring the threshold properly (2026-09)
+
+The 450k floor in the first version of this repo came from `analyze_sessions.py`, which scores one
+candidate at a time: would compacting *here* have paid for itself by the time the session was
+picked back up. That question is well-posed and the answer was right, but it is the wrong
+question, and it undercounts by a lot.
+
+Compaction buys two things, not one:
+
+1. the cold rebuild after cache expiry shrinks from `2.0·C` to `2.0·C′` — **one-time**;
+2. every later turn in that session reads `C′` instead of `C` — **per turn, for the rest of the
+   session**.
+
+Term 2 is larger in any session that keeps going, and no per-event scoring can see it, because the
+saving lands on turns that have not happened yet. Worse, it cannot be estimated by summing over
+candidates: sessions have many idle windows and their remaining-turn ranges overlap, so a naive
+sum double-counts. A first attempt at exactly that produced a savings figure a hundred times
+larger than the entire month's spend — a useful smell test for anyone repeating this.
+
+`replay.py` measures it instead. It replays every session turn by turn, carries an offset for
+context already compacted away, and bills each turn at its real recorded token counts scaled by
+the smaller context. The no-compaction run reproduces actual recorded spend, which bounds the
+whole thing: no policy can save more than the baseline.
+
+What came out, over 1,179 sessions and 302k turns:
+
+- cost splits **52% cache reads / 37% cache writes / 10% output** — the read tax is the main term,
+  and it is linear in context size;
+- the savings curve saturates hard. A 500k threshold captures 56 points of the bill with 44
+  compactions; pushing to 50k adds 15 more points and 222 more compactions;
+- marginal value per compaction falls from ~$1,620 at 800k to ~$6 at 50k;
+- spend is concentrated enough to explain that shape on its own: top 5 sessions = 51% of spend,
+  top 25 = 82%, and a single 38,627-turn session = a third of the month.
+
+Three biases remain, all making compaction look slightly better than it is: the replay only fires
+at windows the session actually resumed from (so compactions wasted on abandoned sessions are not
+billed — measured at ~0.1% at a 300k threshold); the summary is modelled at a flat `C′/C = 0.203`
+rather than per-session; and the baseline is real spend from a window in which the daemon was
+already running for part of the time.
+
+One non-finding worth recording: the dip at 600k in the swept curve is not real. Compacting
+earlier changes which later windows still clear the threshold, and at high thresholds there are
+too few events for that ordering effect to average out.
