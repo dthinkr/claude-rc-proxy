@@ -1,0 +1,111 @@
+name: check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell syntax
+        run: |
+          for f in cc-kit lib/*.sh tools/*/*.sh; do
+            bash -n "$f" || exit 1
+          done
+
+      - name: shellcheck
+        run: |
+          brew install shellcheck
+          shellcheck -S warning cc-kit lib/*.sh tools/*/*.sh
+
+      - name: python compiles
+        run: python3 -m py_compile tools/auto-compact/*.py tools/auto-compact/charts/*.py
+
+      - name: go
+        run: |
+          cd tools/rc-proxy
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "gofmt would change files"; exit 1; }
+          go vet ./...
+          go test ./...
+
+      # Every comment in this repo is English. The Chinese originals were translated
+      # rather than deleted, and this stops them coming back one commit at a time.
+      - name: no CJK in tracked files
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          pat = re.compile(r'[　-〿一-鿿＀-￯]')
+          bad = []
+          for f in subprocess.run(['git', 'ls-files'], capture_output=True, text=True).stdout.split():
+              try:
+                  lines = open(f, encoding='utf-8', errors='ignore').read().split('\n')
+              except OSError:
+                  continue
+              for i, line in enumerate(lines, 1):
+                  if pat.search(line):
+                      bad.append(f'{f}:{i}: {line.strip()[:80]}')
+          if bad:
+              print('\n'.join(bad))
+              sys.exit(f'{len(bad)} lines contain CJK characters')
+          PY
+
+      # House style, enforced because it is easy to lose one line at a time.
+      - name: prose
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          banned = [
+              (r'—', 'em dash'),
+              (r'\bnot (just|only|merely) [a-z]+,? but\b', 'not X but Y'),
+              (r'\b(seamless|robust|leverage|delve|effortless|game.?chang)', 'marketing word'),
+              (r"\bit is worth noting\b", 'filler'),
+              (r"\bdive into\b", 'filler'),
+          ]
+          bad = []
+          files = [f for f in subprocess.run(['git', 'ls-files'], capture_output=True, text=True)
+                   .stdout.split() if f.endswith('.md')]
+          for f in files:
+              for i, line in enumerate(open(f, encoding='utf-8').read().split('\n'), 1):
+                  for pat, why in banned:
+                      if re.search(pat, line, re.I):
+                          bad.append(f'{f}:{i}: [{why}] {line.strip()[:80]}')
+          if bad:
+              print('\n'.join(bad))
+              sys.exit(f'{len(bad)} prose violations')
+          PY
+
+      # Nothing here may reference a file that does not exist. The docs cross-link a lot
+      # and a dead link in a repo like this reads as carelessness about everything else.
+      - name: no dead relative links
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          dead = []
+          for dp, dn, fn in os.walk('.'):
+              if '.git' in dp:
+                  continue
+              for f in fn:
+                  if not (f.endswith('.md') or f == 'cc-kit' or f.endswith('.sh')):
+                      continue
+                  p = os.path.join(dp, f)
+                  s = open(p, encoding='utf-8', errors='ignore').read()
+                  for m in re.finditer(r'\]\(([^)#][^)]*?)\)', s):
+                      t = m.group(1)
+                      if t.startswith(('http', '#', 'mailto')):
+                          continue
+                      if not os.path.exists(os.path.normpath(os.path.join(dp, t.split('#')[0]))):
+                          dead.append(f'{p} -> {t}')
+          if dead:
+              print('\n'.join(dead))
+              sys.exit(f'{len(dead)} dead links')
+          PY
+
+      # The generated path list must match the manifests it is generated from.
+      - name: what-this-touches is up to date
+        run: |
+          ./cc-kit manifest-doc > /tmp/generated.md
+          diff -u docs/what-this-touches.md /tmp/generated.md

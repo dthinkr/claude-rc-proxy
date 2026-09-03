@@ -1,14 +1,17 @@
-# Go build output. Named after the module, and after the move it lands in
-# tools/rc-proxy/ rather than at the root, so these are not anchored.
-claude-rc-proxy
-claude-rc-proxy-go
-
-# Python
 __pycache__/
 *.pyc
+.DS_Store
 
-# Local backups made by the patch scripts. Never commit one.
+# Built locally by tools/rc-proxy/install.sh. Never a Release download: an unsigned
+# Mach-O trips Gatekeeper and produces one identical issue per user.
+tools/rc-proxy/claude-rc-proxy
+
+# Leftovers at the root from the layout before rc-proxy moved into tools/. Anyone who
+# built in the old clone still has these two sitting there.
+/claude-rc-proxy
+/claude-rc-proxy-go
+
+# Backups written by the installers. Also keeps a copy of Anthropic's bundle from being
+# committed by accident: this repo ships no fragment of it.
 *.bak
 *.bak-*
-
-.DS_Store

@@ -85,7 +85,11 @@ MODEL_CEILINGS = _load_ceilings()
 SESSIONS = os.path.expanduser("~/.claude/sessions")
 PROJECTS = os.path.expanduser("~/.claude/projects")
 SOCK_DIR = os.environ.get("CC_INJECT_DIR", "/tmp/cc-inject")
-STATE_DIR = os.path.expanduser("~/.local/state/claude-auto-compact")
+# State lives under ~/.local/state/ccw/, one directory per tool, not under
+# ~/.claude/, which belongs to Anthropic. CCW_STATE_ROOT is only for tests.
+STATE_ROOT = os.environ.get("CCW_STATE_ROOT",
+                            os.path.expanduser("~/.local/state/ccw"))
+STATE_DIR = os.path.join(STATE_ROOT, "auto-compact")
 STATE = os.path.join(STATE_DIR, "state.json")
 LOG = os.path.join(STATE_DIR, "compactd.log")
 TAIL_BYTES = 512 * 1024
@@ -350,7 +354,7 @@ def cmd_status():
         print(f"daemon last ran {age/60:.1f} min ago "
               f"(idle {T_IDLE_MIN//60}-{T_IDLE_MAX//60} min / context {T_CTX:,}){stale}")
     else:
-        print("daemon has not run yet -- launchctl list | grep claude-auto-compact")
+        print("daemon has not run yet -- launchctl list | grep ccw.auto-compact")
     print(f"{'session':<26}{'idle':>8}{'context':>12}  port  verdict")
     for r in sorted(rows, key=lambda x: -x["idle"]):
         ctx = r["ctx"]

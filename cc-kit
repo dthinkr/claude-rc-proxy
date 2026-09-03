@@ -1,0 +1,270 @@
+#!/bin/bash
+#
+# cc-kit: the only documented entry point for this repo.
+#
+#   ./cc-kit doctor                        report what is on this machine, write nothing
+#   ./cc-kit diff open-binary              show the patch without applying it
+#   ./cc-kit install <tool> [<tool>...]    install by name. There is no "all"
+#   ./cc-kit uninstall <tool> [<tool>...]  reverse exactly what the manifest recorded
+#   ./cc-kit status [<tool>]               one line per tool, or the long form for one
+#   ./cc-kit nul-scan FILE...              NUL bytes in the first 512 bytes of each file
+#
+# Tools: open-binary, auto-compact, rc-proxy.
+#
+# There is no "install all" on purpose. The three have very different blast radius, and
+# nobody should acquire a TLS-intercepting single point of failure from a blanket
+# command. A flag that quietly excludes one tool would teach people that flags are safe
+# here, which is the same mistake with an extra step.
+#
+# Every tool runs out of this checkout. Nothing is copied to ~/.local/bin or anywhere
+# else, the launchd plists point at absolute paths inside the clone, and git pull is the
+# whole update procedure. Moving or deleting the clone breaks the agents.
+
+set -euo pipefail
+
+CCW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export CCW_ROOT
+# shellcheck source=lib/common.sh
+. "$CCW_ROOT/lib/common.sh"
+# shellcheck source=lib/launchd.sh
+. "$CCW_ROOT/lib/launchd.sh"
+# shellcheck source=lib/manifest.sh
+. "$CCW_ROOT/lib/manifest.sh"
+
+TOOLS=(open-binary auto-compact rc-proxy)
+
+usage() {
+  sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//;s/^#$//'
+}
+
+is_tool() {
+  local t
+  for t in "${TOOLS[@]}"; do
+    [ "$t" = "$1" ] && return 0
+  done
+  return 1
+}
+
+require_tool() {
+  is_tool "$1" || die "unknown tool: $1
+Tools are: ${TOOLS[*]}
+There is no \"all\"."
+}
+
+# split_args -- fills NAMED with tool names and FLAGS with everything else.
+NAMED=()
+FLAGS=()
+split_args() {
+  NAMED=(); FLAGS=()
+  local a
+  for a in "$@"; do
+    if is_tool "$a"; then
+      NAMED+=("$a")
+    elif [ "$a" = "all" ]; then
+      die "there is no \"all\". Name the tools you want:
+  ./cc-kit install open-binary auto-compact
+The three have very different blast radius. rc-proxy in particular puts every session on
+this machine behind one process that terminates your TLS."
+    else
+      FLAGS+=("$a")
+    fi
+  done
+}
+
+# ---------------------------------------------------------------- doctor ----
+
+doctor() {
+  require_macos
+
+  head1 "System"
+  say "  macOS $(sw_vers -productVersion) ($(uname -m))"
+  say "  bash  ${BASH_VERSION}"
+  say "  this checkout: $CCW_ROOT"
+  printf '\n'
+
+  head1 "Interpreters and tools, resolved to absolute paths"
+  local p
+  for p in node python3 go mitmdump curl; do
+    local found
+    case "$p" in
+      node) found="$(resolve_node || true)" ;;
+      python3) found="$(resolve_python3 || true)" ;;
+      go) found="$(resolve_go || true)" ;;
+      *) found="$(resolve_bin "$p" || true)" ;;
+    esac
+    if [ -n "$found" ]; then
+      printf '  %-9s %s\n' "$p" "$found"
+    else
+      printf '  %-9s %s\n' "$p" "not found"
+    fi
+  done
+  say "  Anything launchd runs must use these absolute paths. A launchd job's PATH does"
+  say "  not include /opt/homebrew/bin. See docs/launchd-notes.md."
+  printf '\n'
+
+  head1 "VS Code"
+  local dirs=0 d
+  while read -r d; do
+    [ -n "$d" ] || continue
+    dirs=$((dirs + 1))
+    local s="$d/settings.json"
+    if [ -f "$s" ]; then
+      local json="cannot check, no python3" py
+      py="$(resolve_python3 || true)"
+      if [ -n "$py" ]; then
+        json="not plain JSON, probably comments"
+        if "$py" -c 'import json,sys; json.load(open(sys.argv[1]))' "$s" 2>/dev/null; then
+          json="plain JSON"
+        fi
+      fi
+      say "  $(tilde "$s")  [$json]"
+      local wrapper
+      wrapper="$(grep -o '"claudeCode.claudeProcessWrapper"[^,}]*' "$s" 2>/dev/null | head -1 || true)"
+      if [ -n "$wrapper" ]; then
+        say "      $wrapper"
+        if [ "${wrapper#*"$CCW_ROOT"}" = "$wrapper" ]; then
+          warn "that wrapper is not in this checkout. auto-compact will refuse to overwrite it."
+        fi
+      fi
+    else
+      say "  $(tilde "$d")  no settings.json yet"
+    fi
+  done < <(vscode_user_dirs)
+  [ "$dirs" = 0 ] && say "  no VS Code user directory found"
+  printf '\n'
+
+  head1 "Claude Code extension"
+  local n=0
+  while read -r d; do
+    [ -n "$d" ] || continue
+    n=$((n + 1))
+    local mark="not patched"
+    grep -q "OPEN-BINARY-FALLBACK-PATCH-v2" "$d/extension.js" 2>/dev/null && mark="patched with v2"
+    say "  $(ext_version "$d")  $mark  ($(commafy "$(wc -c < "$d/extension.js" | tr -d ' ')") bytes)"
+  done < <(claude_ext_dirs || true)
+  [ "$n" = 0 ] && say "  none installed under ~/.vscode/extensions"
+  printf '\n'
+
+  head1 "Cache tier"
+  say "  (auto-compact's 50 to 58 minute window assumes the 1-hour tier)"
+  "$CCW_ROOT/tools/auto-compact/status.sh" --cache-tier 2>&1 | sed '1d' || true
+  printf '\n'
+
+  head1 "launchd agents that would collide"
+  local any=0 label
+  # Only the three names an installer here would fight with. A wider match would list
+  # unrelated agents and claim an installer refuses because of them, which is false.
+  while read -r label; do
+    [ -n "$label" ] || continue
+    any=1
+    case "$label" in
+      "$CCW_LABEL_PREFIX".*) say "  $label   installed by this repo" ;;
+      *) say "  $label   NOT this repo. The matching installer refuses until it is gone." ;;
+    esac
+  done < <(launchctl list 2>/dev/null | awk '$3 ~ /(open.?binary|auto.?compact|rc.?proxy)/ {print $3}' || true)
+  [ "$any" = 0 ] && say "  none loaded"
+  printf '\n'
+
+  head1 "Proxy prerequisites"
+  local f
+  for f in "$HOME/.mitmproxy/mitmproxy-ca.pem" "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" \
+           "$CCW_CONFIG_ROOT/rc-proxy.token"; do
+    if [ -f "$f" ]; then
+      say "  present  $(tilde "$f")  (mode $(stat -f '%Lp' "$f"))"
+    else
+      say "  missing  $(tilde "$f")"
+    fi
+  done
+  printf '\n'
+
+  say "doctor wrote nothing. Next: ./cc-kit diff open-binary"
+}
+
+# ------------------------------------------------------------------ verbs ----
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift || true
+
+case "$cmd" in
+  doctor)
+    doctor
+    ;;
+
+  diff)
+    require_macos
+    tool="${1:-}"
+    [ -n "$tool" ] || die "usage: ./cc-kit diff open-binary"
+    require_tool "$tool"
+    [ -x "$CCW_ROOT/tools/$tool/diff.sh" ] \
+      || die "$tool has no diff. Only open-binary edits a file belonging to someone else,
+so it is the only one with a patch to read before you install it."
+    shift
+    "$CCW_ROOT/tools/$tool/diff.sh" "$@"
+    ;;
+
+  install)
+    require_macos
+    split_args "$@"
+    [ "${#NAMED[@]}" -gt 0 ] || die "name at least one tool.
+  ./cc-kit install open-binary
+Tools are: ${TOOLS[*]}"
+    for t in "${NAMED[@]}"; do
+      head1 "=== install $t ==="
+      "$CCW_ROOT/tools/$t/install.sh" ${FLAGS[@]+"${FLAGS[@]}"}
+      printf '\n'
+    done
+    ;;
+
+  uninstall)
+    require_macos
+    split_args "$@"
+    [ "${#NAMED[@]}" -gt 0 ] || die "name at least one tool.
+  ./cc-kit uninstall open-binary
+Tools are: ${TOOLS[*]}"
+    for t in "${NAMED[@]}"; do
+      head1 "=== uninstall $t ==="
+      "$CCW_ROOT/tools/$t/uninstall.sh" ${FLAGS[@]+"${FLAGS[@]}"}
+      printf '\n'
+    done
+    say "State and config directories are shared. Remove them when nothing is left:"
+    say "  rm -rf ~/.local/state/ccw ~/.config/ccw"
+    ;;
+
+  status)
+    require_macos
+    if [ $# -eq 0 ]; then
+      head1 "A loaded agent proves nothing. The second column is the one that matters."
+      printf '\n'
+      for t in "${TOOLS[@]}"; do
+        "$CCW_ROOT/tools/$t/status.sh" --oneline || true
+      done
+      printf '\n'
+      say "Long form for one tool: ./cc-kit status open-binary"
+    else
+      require_tool "$1"
+      tool="$1"; shift
+      "$CCW_ROOT/tools/$tool/status.sh" "$@"
+    fi
+    ;;
+
+  nul-scan)
+    "$CCW_ROOT/tools/open-binary/nul-scan.sh" "$@"
+    ;;
+
+  # Regenerates docs/what-this-touches.md from the manifests. CI runs this and fails if
+  # the result differs from what is checked in, so the page cannot drift from the code.
+  manifest-doc)
+    # shellcheck source=lib/manifest.sh
+    . "$CCW_ROOT/lib/manifest.sh"
+    manifest_docs "$CCW_ROOT"
+    ;;
+
+  ""|-h|--help|help)
+    usage
+    ;;
+
+  *)
+    die "unknown command: $cmd
+Run ./cc-kit --help"
+    ;;
+esac

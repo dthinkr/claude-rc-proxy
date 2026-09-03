@@ -128,10 +128,18 @@ func envOr(k, def string) string {
 
 var logFile *os.File
 
+// Rotated at startup only, so there is no timer and no size check on the hot path. The
+// process is restarted often enough by launchd that one generation of history is plenty.
+const routeLogMaxBytes = 8 << 20 // 8 MiB
+
 func initLog() {
-	p := os.ExpandEnv("$HOME/.local/state/claude-rc-proxy/route.log")
+	p := os.ExpandEnv("$HOME/.local/state/ccw/rc-proxy/route.log")
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return
+	}
+	if st, err := os.Stat(p); err == nil && st.Size() > routeLogMaxBytes {
+		// Ignore the error. Failing to rotate is not a reason to start without a log.
+		_ = os.Rename(p, p+".1")
 	}
 	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -242,7 +250,7 @@ func (m *certMinter) get(host string) (*tls.Certificate, error) {
 // Persisting fixes it. A cold start reads the previous list as a floor, so injection
 // still works while the gateway is restarting. The list changes slowly, models are added
 // or removed on the order of weeks, so data a few minutes stale beats having none.
-const poolStatePath = "$HOME/.local/state/claude-rc-proxy/pool-models.json"
+const poolStatePath = "$HOME/.local/state/ccw/rc-proxy/pool-models.json"
 
 type poolCache struct {
 	mu     sync.Mutex
@@ -633,7 +641,7 @@ func injectPoolModels(resp *http.Response) error {
 	// the evidence for a "switched model and it says it does not exist" report is in these
 	// responses.
 	if os.Getenv("CLAUDE_RC_PROXY_DUMP_BOOTSTRAP") == "1" {
-		dir := os.ExpandEnv("$HOME/.local/state/claude-rc-proxy/bootstrap-dumps")
+		dir := os.ExpandEnv("$HOME/.local/state/ccw/rc-proxy/bootstrap-dumps")
 		if os.MkdirAll(dir, 0o755) == nil {
 			name := strings.ReplaceAll(resp.Request.URL.RawQuery, "/", "_")
 			if len(name) > 80 {
