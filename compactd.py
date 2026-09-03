@@ -40,6 +40,48 @@ T_CTX = int(os.environ.get("CC_COMPACT_CTX", 450_000))
 #           detail. Idle is measured from the last API response, so a long generation eats
 #           into the margin -- which is part of why the window stops short of 60 min.
 
+# ── Per-model context ceiling. Runs alongside the idle rule and does not interact ──
+# The rule above is a cost saver. Compacting is cheapest while the prompt cache is
+# still warm, so it waits for the session to go quiet. This rule is a brake. Once a
+# session crosses the model's usable window the upstream rejects the request outright,
+# so there is nothing left to optimize and it does not wait for idle. A session being
+# used hard never goes idle for 50 minutes, and that is exactly the session that runs
+# into a ceiling.
+#
+# Values are TRIGGER points, not the model's hard limit. Leave headroom for the growth
+# between two daemon scans. Matching is by longest prefix, so one entry covers a whole
+# family of model ids.
+#
+# Empty by default, and most people should leave it that way. It only matters if you
+# reach models through a gateway, where the ids and the usable windows differ from the
+# defaults Claude Code expects. Set it with CC_COMPACT_CEILINGS, a comma separated list
+# of prefix=tokens pairs:
+#
+#     CC_COMPACT_CEILINGS='<model-id-prefix>=400000,<other-prefix>=250000'
+#
+# Put it in the daemon's launchd plist under EnvironmentVariables, not in your shell,
+# or the daemon will not see it.
+def _load_ceilings():
+    out = {}
+    for part in os.environ.get("CC_COMPACT_CEILINGS", "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        prefix, sep, cap = part.partition("=")
+        prefix = prefix.strip()
+        if not sep or not prefix:
+            print(f"compactd: ignoring malformed CC_COMPACT_CEILINGS entry {part!r}",
+                  file=sys.stderr)
+            continue
+        try:
+            out[prefix] = int(cap.strip().replace("_", ""))
+        except ValueError:
+            print(f"compactd: ignoring non-numeric ceiling in {part!r}", file=sys.stderr)
+    return out
+
+
+MODEL_CEILINGS = _load_ceilings()
+
 SESSIONS = os.path.expanduser("~/.claude/sessions")
 PROJECTS = os.path.expanduser("~/.claude/projects")
 SOCK_DIR = os.environ.get("CC_INJECT_DIR", "/tmp/cc-inject")
@@ -203,6 +245,101 @@ def scan():
     return list(best.values())
 
 
+def ceiling_for(model):
+    """Usable ceiling for this model id, or None if no entry covers it.
+
+    Longest prefix wins rather than exact equality. Gateway model ids carry suffixes,
+    so an exact match would let a whole family slip past its ceiling unnoticed.
+    """
+    if not model:
+        return None
+    hit = None
+    for name, cap in MODEL_CEILINGS.items():
+        if model.startswith(name) and (hit is None or len(name) > len(hit[0])):
+            hit = (name, cap)
+    return hit[1] if hit else None
+
+
+def at_ceiling(ctx, model):
+    cap = ceiling_for(model)
+    return cap is not None and ctx is not None and ctx >= cap
+
+
+def model_for(path):
+    """Model id on the last assistant record in the tail, or None if unreadable.
+
+    This scans the tail again instead of having read_tail return one more value, so
+    the existing idle rule's code is left untouched. The extra read comes out of the
+    page cache and happens once every two minutes, so the cost is negligible.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - TAIL_BYTES))
+            chunk = fh.read()
+    except OSError:
+        return None
+    lines = chunk.split(b"\n")
+    if size > TAIL_BYTES:
+        lines = lines[1:]                      # first line is probably truncated
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            o = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if o.get("type") != "assistant" or o.get("isSidechain"):
+            continue
+        m = (o.get("message") or {}).get("model")
+        if m:
+            return m
+    return None
+
+
+def run_ceilings(st, rows, dry):
+    """Ceiling rule: compact once the session reaches the model's usable window,
+    regardless of idle time.
+
+    Shares ent["armed"] with the idle rule. Firing sets it False, and the idle rule
+    sets it True again once context drops back under T_CTX. That is what stops both
+    rules sending /compact to the same session in one pass: this loop runs after that
+    one, so any session it just fired on already reads as armed=False here.
+    """
+    fired = 0
+    for r in rows:
+        ctx = r["ctx"]
+        if ctx is None:
+            continue
+        ent = st.setdefault(r["sid"], {"armed": True})
+        if not isinstance(ent, dict) or not ent.get("armed", True):
+            continue
+        model = model_for(r["transcript"])
+        if not at_ceiling(ctx, model):
+            continue
+        if not r["sock"]:
+            continue          # the idle rule already warned about a missing shim
+        cap = ceiling_for(model)
+        if dry:
+            log(f"[dry-run] would compact {r['name']}  ceiling {cap:,} ({model})  "
+                f"context {ctx:,}")
+            fired += 1
+            continue
+        ok, detail = inject(r["pid"], "/compact")
+        if ok:
+            ent.update(armed=False, last_fired=time.time(), last_ctx=ctx,
+                       ceiling_fired_at=time.time())
+            log(f"compacted {r['name']}  ceiling {cap:,} ({model})  context {ctx:,}"
+                f"  (past the model's usable window, not a cache bet)")
+            fired += 1
+        else:
+            # This retries every 2 minutes, so throttle the failure log or it floods.
+            if time.time() - ent.get("ceiling_fail_logged_at", 0) > 1800:
+                log(f"ceiling injection failed for {r['name']}: {detail}")
+                ent["ceiling_fail_logged_at"] = time.time()
+    return fired
+
+
 def cmd_status():
     rows = scan()
     st = load_state()
@@ -236,6 +373,21 @@ def cmd_status():
             note += f"   [same conversation also open as {', '.join(r['twins'])}; only this one is sent to]"
         print(f"{r['name']:<26}{r['idle']/60:>7.0f}m{(ctx or 0):>12,}"
               f"{'   yes' if r['sock'] else '    no'}  {note}")
+
+    # View for the ceiling rule. Listed separately; the table above is unchanged.
+    if not MODEL_CEILINGS:
+        print("\nceilings: none configured (set CC_COMPACT_CEILINGS to enable)")
+        return
+    caps = ", ".join(f"{m}* {c//1000}k" for m, c in sorted(MODEL_CEILINGS.items()))
+    print(f"\nceilings (fire regardless of idle): {caps}")
+    for r in sorted(rows, key=lambda x: -(x["ctx"] or 0)):
+        model = model_for(r["transcript"])
+        cap = ceiling_for(model)
+        if cap is None:
+            continue
+        left = cap - (r["ctx"] or 0)
+        verdict = ">>> due" if left <= 0 else f"{left:,} to go"
+        print(f"  {r['name']:<24}{model:<16}{(r['ctx'] or 0):>10,}  {verdict}")
 
 
 def cmd_run(dry):
@@ -289,6 +441,8 @@ def cmd_run(dry):
             fired += 1
         else:
             log(f"injection failed for {r['name']}: {detail}")
+
+    fired += run_ceilings(st, rows, dry)
 
     # Heartbeat. The daemon is silent when it has nothing to do, so without this there is
     # no way to tell "running, nothing due" from "not running".
