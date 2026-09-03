@@ -25,6 +25,13 @@ jobs:
       - name: python compiles
         run: python3 -m py_compile tools/auto-compact/*.py tools/auto-compact/charts/*.py
 
+      # The macOS runner ships no Go toolchain. Without this step the job dies with
+      # "go: command not found", which is the same shape as the launchd PATH problem in
+      # docs/launchd-notes.md: the tool is on your PATH and not on the job's.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/rc-proxy/go.mod
+
       - name: go
         run: |
           cd tools/rc-proxy
