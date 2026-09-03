@@ -1,48 +1,69 @@
-// claude-rc-proxy — 让 Claude Code 同时拥有 Remote Control 和 CLIProxyAPI 轮换池。
+// claude-rc-proxy lets Claude Code use a model gateway without giving up any
+// first-party feature.
 //
-// 为什么存在
-// ──────────
-// Claude Code v2.1.196 起加了门禁:ANTHROPIC_BASE_URL 一旦不指向 api.anthropic.com,
-// Remote Control 立即关闭;ANTHROPIC_AUTH_TOKEN 又会让 session 被判成 API-key 认证,
-// 同样出局。所以不能用"改 base URL"接代理,只能做正向代理:让 Claude Code 以为
-// 自己在直连 api.anthropic.com(两道门禁都过),我们在网络层把推理流量拐去 CPA。
+// Why it exists
+// ─────────────
+// Claude Code v2.1.196 added a gate. Point ANTHROPIC_BASE_URL anywhere other than
+// api.anthropic.com and Remote Control switches off. Set ANTHROPIC_AUTH_TOKEN and the
+// session is treated as API-key auth, which is out too. So you cannot attach a gateway
+// by changing the base URL. A forward proxy is the way in: Claude Code believes it is
+// talking straight to api.anthropic.com, which clears both gates, and the inference
+// traffic is diverted at the network layer.
 //
-// 它只做两件事,别的一律原样放行:
-//  1. /v1/messages*                 → 改道 CLIProxyAPI(127.0.0.1:8317),换 token
-//  2. /api/claude_cli/bootstrap 的响应 → 把池里的型号塞回模型选择器
+// It changes two things and passes everything else through untouched:
+//  1. /v1/messages*                     → routed to the gateway, with the token swapped
+//  2. the /api/claude_cli/bootstrap body → gateway models added to the model picker
 //
-// 为什么用 Go 重写(替掉原来的 mitmproxy + Python addon)
-// ─────────────────────────────────────────────────────
-// mitmproxy 是**单线程 asyncio,没有 worker 模式**。多会话用户(几十个并发
-// Claude Code 实例)的全部流量挤过那一个事件循环,任何一次阻塞就是全体停摆:
-// 实测单请求级阻塞会放大到秒级 event-loop stall、成片的连接 reset,
-// 以及客户端侧的初始化超时。
+// That second point about passing everything else through is the whole design, not a
+// detail. Remote Control keeps working, and so does anything else that talks to
+// Anthropic's own endpoints, publishing Artifacts included. Swapping the base URL
+// sends all of it to the gateway and breaks all of it at once.
 //
-// Go 版每条连接一个 goroutine,跑满所有核心,一个慢请求卡不住别人。
-// 而且这里只有两条改写规则,代码量是 mitmproxy 通用框架的零头 —— 能坏的地方少得多。
+// Why Go, replacing the original mitmproxy plus Python addon
+// ─────────────────────────────────────────────────────────
+// mitmproxy is single-threaded asyncio with no worker mode. All traffic from a user
+// running dozens of concurrent Claude Code instances funnels through one event loop,
+// and any single block stalls every session at once. Measured: a per-request block
+// grew into seconds of event-loop stall, connection resets in batches, and client-side
+// initialization timeouts.
 //
-// 设计上的取舍(都是有意的)
-// ──────────────────────────
-//   - **重启不能续上正在流式吐字的那一轮**。/v1/messages 是一条流,进程一死
-//     TCP 就 RST,那一轮已经结束。能做的是让 9801 **立刻又能接新 CONNECT**,
-//     这样老窗口不用关:RC 心跳自己重连,用户点 retry / 发下一条即通。
-//     做不到的是把已掐断的生成无缝接回去。
-//   - **客户端和对上游都走 HTTP/1.1**。对客户端 ALPN 不宣告 h2(Claude Code
-//     会自动降级)。对上游曾经 ForceAttemptHTTP2 想省连接,结果几十个 session
-//     的 RC 长轮询 / 心跳 / 日志复用到 Anthropic 的少数几条 H2 上;对端一发
-//     INTERNAL_ERROR,全体一起 timeout。2026-08-25 实测:进程生命周期内 383 次
-//     H2 INTERNAL_ERROR,卡死时段伴随 TLS handshake timeout 风暴。H1 下一条
-//     连接死只死自己。为避免重启时几十个 session 同时重连打出 TLS 握手风暴,
-//     新握手最多并发 4 条;握手完成后长轮询照常各走各的 H1 连接。
-//   - **非 api.anthropic.com 的 CONNECT 一律裸隧道对拷**,不解 TLS。
-//     这些流量我们既不看也不改,解了纯属浪费 —— 旧版一次会话白扛 1139 条这种连接。
-//   - **绝不整体读取请求体**。推理请求体是整个对话历史(实测有 4MB 的),
-//     只读头部 4KB 做模型名归一化,剩下的直接流式转发。
-//   - **流式响应零缓冲**(FlushInterval = -1)。RC 的入方向是 /bridge 长轮询,
-//     一缓冲就把手机→电脑的通道憋死。
+// The Go version gives each connection its own goroutine, uses every core, and one slow
+// request cannot hold up the rest. There are also only two rewrite rules here, so the
+// code is a fraction of a general-purpose interception framework and has far less that
+// can break.
 //
-// 复用 mitmproxy 的 CA(~/.mitmproxy/mitmproxy-ca.pem),所以客户端侧的
-// NODE_EXTRA_CA_CERTS 一个字都不用改,换过来是纯抽换。
+// Deliberate trade-offs
+// ─────────────────────
+//   - A restart cannot resume a turn that is mid-stream. /v1/messages is one stream, and
+//     when the process dies the TCP connection is reset, so that turn is over. What it
+//     does instead is accept new CONNECTs on the listener immediately, so you do not
+//     have to close the window: the Remote Control heartbeat reconnects on its own and
+//     the next message or a retry goes through. Splicing a cut-off generation back
+//     together is not possible.
+//   - HTTP/1.1 to the client and to the upstream. The client-facing ALPN does not offer
+//     h2 and Claude Code downgrades on its own. The upstream once used
+//     ForceAttemptHTTP2 to save connections, which multiplexed the long polls,
+//     heartbeats and logging of dozens of sessions onto a handful of H2 connections to
+//     Anthropic. One INTERNAL_ERROR from the far end then timed out all of them
+//     together. Measured 2026-08-25: 383 H2 INTERNAL_ERRORs in one process lifetime,
+//     with the frozen stretches accompanied by a storm of TLS handshake timeouts. Under
+//     H1 a dead connection takes only itself down. New handshakes are capped at 4 at a
+//     time so that a restart does not set off a handshake storm as every session
+//     reconnects at once; once a handshake completes, long polls carry on over their own
+//     H1 connections.
+//   - Every CONNECT to a host other than api.anthropic.com is copied through as a raw
+//     tunnel with no TLS interception. That traffic is neither read nor modified, so
+//     decrypting it would be pure waste. The old version decrypted 1139 such connections
+//     in a single session for nothing.
+//   - The request body is never read whole. An inference body is the entire conversation
+//     history and a 4 MB one has been seen in practice. Only the leading 4 KB is read,
+//     to normalize the model name, and the rest is streamed straight through.
+//   - Streaming responses are not buffered at all (FlushInterval = -1). The inbound
+//     direction of Remote Control is a /bridge long poll, and buffering it chokes the
+//     phone-to-computer channel.
+//
+// It reuses the mitmproxy CA at ~/.mitmproxy/mitmproxy-ca.pem, so NODE_EXTRA_CA_CERTS on
+// the client side needs no change and switching over is a straight swap.
 package main
 
 import (
@@ -101,9 +122,9 @@ func envOr(k, def string) string {
 	return def
 }
 
-// ───────────────────────────── 日志 ─────────────────────────────
-// 逐请求日志默认关闭:一次 VSCode 启动上万个请求,写日志本身就会变成瓶颈
-// (旧版 Python 每行都 makedirs+open+close,是实测的成本之一)。
+// ───────────────────────────── Logging ─────────────────────────────
+// Per-request logging is off by default. One VS Code launch makes tens of thousands of
+// requests, and the old Python version's makedirs+open+close per line was a measured cost.
 
 var logFile *os.File
 
@@ -127,7 +148,7 @@ func vlog(format string, a ...any) {
 	}
 }
 
-// ──────────────────────── 证书:用 mitmproxy 的 CA 现签 ────────────────────────
+// ──────────────────── Certificates: minted on the fly from the mitmproxy CA ────────────────────
 
 type certMinter struct {
 	ca    tls.Certificate
@@ -139,9 +160,9 @@ type certMinter struct {
 func newCertMinter(path string) (*certMinter, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("读不到 CA %s: %w", path, err)
+		return nil, fmt.Errorf("cannot read CA %s: %w", path, err)
 	}
-	// mitmproxy-ca.pem 里是「私钥 + 证书」拼在一起,得自己拆。
+	// mitmproxy-ca.pem holds the private key and the certificate concatenated, so split them.
 	var certDER []byte
 	var key any
 	for block, rest := pem.Decode(raw); block != nil; block, rest = pem.Decode(rest) {
@@ -158,11 +179,11 @@ func newCertMinter(path string) (*certMinter, error) {
 			key, err = x509.ParseECPrivateKey(block.Bytes)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("解析 CA 私钥失败: %w", err)
+			return nil, fmt.Errorf("failed to parse CA private key: %w", err)
 		}
 	}
 	if certDER == nil || key == nil {
-		return nil, errors.New("CA 文件里没同时找到证书和私钥")
+		return nil, errors.New("CA file does not contain both a certificate and a private key")
 	}
 	leaf, err := x509.ParseCertificate(certDER)
 	if err != nil {
@@ -198,7 +219,7 @@ func (m *certMinter) get(host string) (*tls.Certificate, error) {
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{host},
 	}
-	// CA 可能是 RSA 也可能是 EC,签名算法由 x509 按 CA 私钥类型自己选。
+	// The CA may be RSA or EC. x509 picks the signature algorithm from the CA key type.
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, m.leaf, &priv.PublicKey, m.ca.PrivateKey)
 	if err != nil {
 		return nil, err
@@ -208,17 +229,19 @@ func (m *certMinter) get(host string) (*tls.Certificate, error) {
 	return c, nil
 }
 
-// ──────────────────────── 池内模型列表(带 TTL 缓存) ────────────────────────
+// ──────────────────────── Gateway model list, with a TTL cache ────────────────────────
 
-// 模型列表要**落盘**,不能只放内存。
+// The model list has to be persisted, not just held in memory.
 //
-// 注入是 session 启动时的一锤子买卖:bootstrap 响应只来一次,那一刻拿不到列表,
-// 这个 session 就永久没有池内模型,之后选 gpt-5.6-sol 必然报
-// "There's an issue with the selected model … It may not exist"。
-// 而 CPA 重启只要几秒,期间起的 session 全中招 —— 实际发生过,而且很难联想到病因。
+// Injection is a one-shot at session start. The bootstrap response arrives exactly once,
+// so a session that misses the list at that moment has no gateway models for its whole
+// life, and selecting one reports "There's an issue with the selected model ... It may
+// not exist". A gateway restart takes only seconds, but every session started during it
+// is hit, and the cause is very hard to guess from the symptom.
 //
-// 落盘之后:冷启动时先读上次的列表垫底,CPA 正在重启也照样能注入。
-// 列表变化极慢(型号增减是按周计的),用过期几分钟的数据远好过一个都没有。
+// Persisting fixes it. A cold start reads the previous list as a floor, so injection
+// still works while the gateway is restarting. The list changes slowly, models are added
+// or removed on the order of weeks, so data a few minutes stale beats having none.
 const poolStatePath = "$HOME/.local/state/claude-rc-proxy/pool-models.json"
 
 type poolCache struct {
@@ -231,13 +254,13 @@ const poolTTL = 5 * time.Minute
 
 var pool poolCache
 
-// seen 记录每个型号最后一次出现在 CPA 列表里的时间。
-// 只保留 seenTTL 之内的 —— 真的下架的型号最终会自己消失。
+// seen records the last time each model id appeared in the gateway's list.
+// Only entries within seenTTL are kept, so a model that is genuinely gone drops out.
 var seen = map[string]int64{}
 
 const seenTTL = 7 * 24 * time.Hour
 
-// loadDisk 把上次落盘的「见过的型号」读进来。调用方须持锁。
+// loadDisk reads the previously persisted "models seen" set. Caller must hold the lock.
 func (p *poolCache) loadDisk() {
 	if len(seen) > 0 {
 		return
@@ -247,7 +270,7 @@ func (p *poolCache) loadDisk() {
 		return
 	}
 	if json.Unmarshal(raw, &seen) != nil || len(seen) == 0 {
-		// 兼容早期的 []string 格式
+		// tolerate the earlier []string format
 		var ids []string
 		if json.Unmarshal(raw, &ids) != nil {
 			seen = map[string]int64{}
@@ -258,20 +281,22 @@ func (p *poolCache) loadDisk() {
 			seen[id] = now
 		}
 	}
-	log.Printf("START  从磁盘恢复见过的型号 %d 个", len(seen))
+	log.Printf("START  restored %d seen models from disk", len(seen))
 }
 
-// merge 把这次拉到的列表并进 seen,返回**并集**(live 在前,保持 CPA 的顺序)。
+// merge folds the freshly fetched list into seen and returns the UNION, live first so the
+// gateway's own ordering is preserved.
 //
-// ★ 为什么要并集而不是直接用 live:
+// Why a union rather than just the live list:
 //
-//	CPA 会把**限流中**的模型从 /v1/models 里摘掉(实测 13 → 10,少掉的正是
-//	额度耗尽的 glm-5.3 / kimi-k3 / deepseek-v4-pro)。而注入是切模型时才发生的,
-//	所以那一刻正在冷却的型号就从选择器里消失,你选它就报
-//	"There's an issue with the selected model … It may not exist" ——
-//	过一阵冷却结束又自己好了,表现就是"用着用着就不行了",极难联想到病因。
-//	保留并集之后:冷却中的型号仍可选,选中会给一句明确的额度错误(可行动),
-//	而不是"模型不存在"(莫名其妙)。
+//	A gateway drops rate-limited models from its /v1/models response. Injection only
+//	happens when you switch models, so a model that is cooling down at that moment
+//	vanishes from the picker, and selecting it reports "There's an issue with the
+//	selected model ... It may not exist". Once the cooldown ends it comes back on its
+//	own, which reads as "it worked and then it stopped" and is very hard to diagnose.
+//
+//	Keeping the union means a cooling-down model stays selectable and returns a clear
+//	quota error you can act on, instead of a "does not exist" that makes no sense.
 func (p *poolCache) merge(live []string) []string {
 	now := time.Now()
 	for _, id := range live {
@@ -286,18 +311,18 @@ func (p *poolCache) merge(live []string) []string {
 	cutoff := now.Add(-seenTTL).Unix()
 	for id, ts := range seen {
 		if ts < cutoff {
-			delete(seen, id) // 真下架了,过 7 天自己消失
+			delete(seen, id) // genuinely gone; it ages out after seenTTL
 			continue
 		}
 		if !inLive[id] {
 			extra = append(extra, id)
 		}
 	}
-	sort.Strings(extra) // 顺序稳定,别让选择器每次刷新都乱跳
+	sort.Strings(extra) // stable order, so the picker does not reshuffle on every refresh
 	return append(out, extra...)
 }
 
-// saveDisk 落盘。失败不影响主流程 —— 它只是个优化。
+// saveDisk persists the set. Failure does not affect the main path; this is only an optimization.
 func (p *poolCache) saveDisk() {
 	raw, err := json.Marshal(seen)
 	if err != nil {
@@ -307,7 +332,7 @@ func (p *poolCache) saveDisk() {
 	if os.MkdirAll(filepath.Dir(path), 0o755) != nil {
 		return
 	}
-	// 先写临时文件再 rename,避免读到写了一半的内容
+	// write a temp file and rename, so a reader never sees a half-written file
 	tmp := path + ".tmp"
 	if os.WriteFile(tmp, raw, 0o644) == nil {
 		_ = os.Rename(tmp, path)
@@ -329,8 +354,8 @@ func (p *poolCache) models_() []string {
 	cli := &http.Client{Timeout: 2 * time.Second}
 	resp, err := cli.Do(req)
 	if err != nil {
-		// 取不到就用「见过的型号」顶着 —— 列表变化很慢,
-		// 用过期几分钟的数据远好过让选择器空掉。
+		// fall back to the seen set. The list changes slowly, and data that is a few
+		// minutes stale beats an empty picker.
 		if len(p.models) == 0 {
 			p.models = p.merge(nil)
 		}
@@ -358,20 +383,19 @@ func (p *poolCache) models_() []string {
 	return p.models
 }
 
-// ──────────────────────── 模型名归一化 ────────────────────────
+// ──────────────────────── Model name normalization ────────────────────────
 //
-// Claude Code 从 Anthropic 拿到的型号带上下文变体后缀(claude-fable-5[1m]),
-// 而 CPA 池里注册的是裸名。不去掉后缀池子会报模型不存在。
+// Anthropic hands Claude Code model ids carrying a context-variant suffix, written as
+// name[1m]. Gateways register the bare name, so leaving the suffix on makes the gateway
+// report that the model does not exist.
 //
-// ★ 绝不整体读请求体。推理请求体是整个对话历史,实测有 4MB 的;
-//   Python 旧版对每条请求做全量 parse+dump,一次 43 毫秒,全是阻塞。
-//   这里只读头部 4KB(model 字段在 JSON 开头),改完把头部和剩余流拼起来继续流式转发。
+// Never read the whole request body. An inference body is the entire conversation history
 
 var modelSuffixRE = regexp.MustCompile(`("model"\s*:\s*"[^"\[]+)\[[^"\]]*\]"`)
 
 const headWindow = 4096
 
-// stripModelSuffix 返回新的 body reader 和长度增量(负数表示变短了)。
+// stripModelSuffix returns a new body reader and the length delta, negative when it shrank.
 func stripModelSuffix(body io.ReadCloser) (io.ReadCloser, int, error) {
 	head := make([]byte, headWindow)
 	n, err := io.ReadFull(body, head)
@@ -390,16 +414,16 @@ func stripModelSuffix(body io.ReadCloser) (io.ReadCloser, int, error) {
 	}{rest, body}, delta, nil
 }
 
-// ──────────────────── H2 控制请求的安全重放 ────────────────────
+// ──────────────────── Safe replay of H2 control requests ────────────────────
 //
-// Go 的 H2 Transport 会自动重试 peer PROTOCOL_ERROR / REFUSED_STREAM,但 POST
-// body 已经写出后必须有 GetBody 才能重放。没有它时,一条共享 H2 连接出错会让同
-// 连接上的 heartbeat 一起报 "cannot rewind body after connection loss"。
+// Go's H2 transport retries peer PROTOCOL_ERROR and REFUSED_STREAM on its own, but once a
+// POST body has been written it needs GetBody to replay. Without it, one error on a shared
+// H2 connection makes every heartbeat on that same connection fail with
 //
-// 只给明确幂等、体积有界的控制请求补 GetBody。推理请求、worker events、注册和
-// 未知长度 body 一律不碰:重复发送有副作用的 POST 比偶发失败更危险。
+// "cannot rewind body after connection loss".
+//
 
-const replayableBodyLimit int64 = 1 << 20 // 1 MiB;正常 heartbeat 远小于这个值
+const replayableBodyLimit int64 = 1 << 20 // 1 MiB; a normal heartbeat is far smaller
 
 func isReplayableControlPost(r *http.Request) bool {
 	if r.Method != http.MethodPost {
@@ -413,8 +437,8 @@ func isReplayableControlPost(r *http.Request) bool {
 		strings.HasSuffix(path, "/worker/heartbeat")
 }
 
-// makeReplayableControlBody 给安全的小 POST 设置 Body + GetBody。任何不确定情况
-// 都保持原始流语义;返回 true 仅表示已成功变成可重放请求。
+// makeReplayableControlBody sets Body and GetBody for small, safe POSTs. Anything uncertain
+// keeps the original stream semantics. Returning true means the request is now replayable.
 func makeReplayableControlBody(r *http.Request) bool {
 	if !isReplayableControlPost(r) || r.Body == nil || r.Body == http.NoBody ||
 		r.ContentLength <= 0 || r.ContentLength > replayableBodyLimit {
@@ -424,7 +448,7 @@ func makeReplayableControlBody(r *http.Request) bool {
 	original := r.Body
 	raw, err := io.ReadAll(io.LimitReader(original, replayableBodyLimit+1))
 	if err != nil || int64(len(raw)) > replayableBodyLimit {
-		// 已经读走的前缀必须塞回去,失败不能改变原请求的字节流。
+		// the prefix already consumed has to go back; a failure must not alter the byte stream
 		r.Body = struct {
 			io.Reader
 			io.Closer
@@ -443,11 +467,11 @@ func makeReplayableControlBody(r *http.Request) bool {
 	return true
 }
 
-// ──────────────────────── 反向代理:两条路由 ────────────────────────
+// ──────────────────────── Reverse proxy: two routes ────────────────────────
 
-// dialAnthropicTLS 只限制昂贵的 TCP+TLS 建连阶段,不限制已经建立的 RC 长轮询。
-// 进程重启时几十个 Claude Code session 会同时重连;不做背压会让 Anthropic
-// 端出现成片 TLS handshake timeout,随后所有客户端一起重试,形成正反馈风暴。
+// dialAnthropicTLS throttles only the expensive TCP and TLS setup, never an established
+// long poll. Dozens of Claude Code sessions reconnect at once when the process restarts,
+// and with no backpressure that produces TLS handshake timeouts in batches, after which
 func dialAnthropicTLS(ctx context.Context, network, addr string) (net.Conn, error) {
 	select {
 	case anthropicTLSGate <- struct{}{}:
@@ -487,32 +511,32 @@ func newReverseProxy(minter *certMinter) *httputil.ReverseProxy {
 	realURL := &url.URL{Scheme: "https", Host: anthropicHost}
 
 	return &httputil.ReverseProxy{
-		// FlushInterval = -1:每次写入立刻 flush,不缓冲。
-		// RC 的入方向是 /bridge 长轮询,SSE 推理回复也一样 —— 一缓冲就憋死。
+		// FlushInterval = -1: flush on every write, no buffering.
+		// The inbound side of Remote Control is a /bridge long poll and streamed replies are
 		FlushInterval: -1,
 		Transport: &http.Transport{
-			Proxy:                 nil, // 我们**就是**代理,绝不能再套一层,否则自环
+			Proxy:                 nil, // we ARE the proxy; layering another one here would self-loop
 			DialContext:           upstreamDialer.DialContext,
 			DialTLSContext:        dialAnthropicTLS,
 			MaxIdleConns:          512,
 			MaxIdleConnsPerHost:   128,
 			IdleConnTimeout:       90 * time.Second,
 			ExpectContinueTimeout: time.Second,
-			// 禁止上游 H2。省连接的代价是所有 session 共享故障域,见文件头。
+			// No H2 upstream. Saving connections costs a shared failure domain. See the file header.
 			ForceAttemptHTTP2: false,
 		},
 		Director: func(r *http.Request) {
 			path := r.URL.Path
 			if strings.HasPrefix(path, "/v1/messages") {
 				if poolToken == "" {
-					// 没 token 宁可失败,也不能拿订阅额度去跑推理
-					r.URL.Scheme, r.URL.Host = "http", "127.0.0.1:1" // 必然连不上
+					// fail rather than quietly spend subscription quota on inference
+					r.URL.Scheme, r.URL.Host = "http", "127.0.0.1:1" // guaranteed to fail to connect
 					return
 				}
 				r.URL.Scheme, r.URL.Host = poolURL.Scheme, poolURL.Host
 				r.Host = poolURL.Host
 				r.Header.Set("Authorization", "Bearer "+poolToken)
-				r.Header.Del("X-Api-Key") // CPA 会自己补身份头,别冲突
+				r.Header.Del("X-Api-Key") // the gateway supplies its own identity header; do not clash
 
 				if r.Body != nil {
 					nb, delta, err := stripModelSuffix(r.Body)
@@ -527,23 +551,23 @@ func newReverseProxy(minter *certMinter) *httputil.ReverseProxy {
 				vlog("POOL   %s %s", r.Method, truncate(path, 60))
 				return
 			}
-			// 控制面(RC bridge/注册/心跳、oauth、bootstrap…)原样直送真 Anthropic,
-			// 必须保持订阅身份,不能改道。
+			// The control plane (Remote Control bridge, registration, heartbeat, oauth, bootstrap and
+			// the rest) goes straight to the real Anthropic. It must keep the subscription identity.
 			r.URL.Scheme, r.URL.Host = realURL.Scheme, realURL.Host
 			r.Host = anthropicHost
-			// RC 长轮询经常被客户端取消。复用这类上游 H1 连接会逐渐污染
-			// Transport:新控制面请求收不到响应,而直连 Anthropic 仍正常。
-			// 每条控制面请求结束就关连接;推理仍复用便宜的 localhost:8317。
+			// Remote Control long polls are cancelled by the client all the time. Reusing those
+			// upstream H1 connections slowly poisons the Transport: new control-plane requests get
+			// no response while a direct connection to Anthropic still works. So close the
 			r.Close = true
 			if makeReplayableControlBody(r) {
 				vlog("REPLAY %s %s", r.Method, truncate(path, 60))
 			}
 
-			// bootstrap 的响应我们要改(往里塞池内模型),所以必须拿到明文。
-			// 客户端自己带的 Accept-Encoding: gzip 会让 Transport 原样透传压缩字节,
-			// 解不动就只能静默放行 —— 那正是第一版注入失效的原因。
-			// 删掉之后 Transport 会自己加 gzip 并**透明解压**,我们拿到的就是明文。
-			// 只对这一条路径做,别的响应照旧压缩传输。
+			// The bootstrap response gets modified, which means it has to arrive as plaintext.
+			// An Accept-Encoding: gzip the client set itself makes the Transport pass the compressed
+			// bytes through untouched, and anything we cannot decode has to be forwarded as-is. That
+			// is exactly how the first version of this injection failed, silently. Delete the header
+			// and the Transport adds gzip itself and decompresses transparently.
 			if strings.HasPrefix(path, "/api/claude_cli/bootstrap") {
 				r.Header.Del("Accept-Encoding")
 			}
@@ -557,20 +581,18 @@ func newReverseProxy(minter *certMinter) *httputil.ReverseProxy {
 	}
 }
 
-// injectPoolModels 把轮换池里的型号补进模型选择器。
+// injectPoolModels adds the gateway's models to the model picker.
 //
-// forward-proxy 模式下 Claude Code 以为自己直连 Anthropic,模型列表来自
-// /api/claude_cli/bootstrap 的 additional_model_options —— 那里只有 Anthropic
-// 给这个订阅的型号,glm-5.3 / kimi-k3 / grok-4.6 全没了。补进去选择器就恢复原样。
-//
-// 注入的是**裸名**(不带 [1m]),所以 settings.json 里的 model 也必须写裸名,
-// 否则 CC 判定该型号无效、静默回落到 opus。踩过。
+// In forward-proxy mode Claude Code believes it is talking to Anthropic directly, so its
+// model list comes from additional_model_options in /api/claude_cli/bootstrap. That list
+// holds only the models Anthropic offers this subscription, so every gateway model is
+// missing until they are added back here.
 func injectPoolModels(resp *http.Response) error {
-	// 推理失败时把错误原文记下来。Claude Code 把**所有**模型级失败都渲染成
+	// Record the upstream error text when inference fails. Claude Code renders EVERY
 	// "There's an issue with the selected model (X). It may not exist or you may
-	// not have access to it." —— 额度耗尽、模型不支持某个特性、上游 5xx,
-	// 用户看到的都是同一句话,完全没法定位。这里是唯一能看到真实原因的地方。
-	// 只在 >=400 时读 body(错误响应都很小),正常流式响应一个字节都不碰。
+	// model-level failure as the same sentence, "...does not exist or you do not have access
+	// to it." Quota exhausted, an unsupported feature, an upstream 5xx: the user sees one
+	// message with nothing to act on. This is the only place the real reason is visible.
 	if strings.HasPrefix(resp.Request.URL.Path, "/v1/messages") && resp.StatusCode >= 400 {
 		raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
@@ -592,24 +614,24 @@ func injectPoolModels(resp *http.Response) error {
 	}
 	ids := pool.models_()
 	if len(ids) == 0 {
-		// 走到这里意味着这个 session 会**永久**没有池内模型 —— bootstrap 只来一次。
-		// 用户侧的表现是选 gpt-5.6-sol 报 "It may not exist",且完全联想不到病因。
-		// 落盘缓存就是为了让这条几乎不可能发生;真发生了必须看得见。
-		log.Printf("WARN   拿不到池内模型列表,本次 bootstrap 未注入 —— " +
-			"该 session 的模型选择器里不会有池内型号")
+		// Reaching here means this session will have NO gateway models for its entire life,
+		// because bootstrap arrives only once. The user sees a model that reports it does not
+		// exist, with no way to connect that to the cause. The on-disk cache exists to make this
+		log.Printf("WARN   could not fetch the gateway model list; this bootstrap was not injected. " +
+			"the model picker in this session will not show gateway models")
 		return nil
 	}
-	// bootstrap 响应很小,整体读没问题(不像推理请求体动辄几 MB)。
+	// The bootstrap response is small, so reading it whole is fine, unlike an inference body.
 	raw, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
 		return err
 	}
 
-	// 排查用:CLAUDE_RC_PROXY_DUMP_BOOTSTRAP=1 时把注入前的响应原样存下来。
-	// 切模型会重新拉 bootstrap 且把型号带在 query 里
-	// (?entrypoint=claude-vscode&model=gpt-5.6-sol),所以"切了模型就报
-	// It may not exist"的现场就在这些响应里。
+	// For debugging: CLAUDE_RC_PROXY_DUMP_BOOTSTRAP=1 saves the response before injection.
+	// Switching models refetches bootstrap and carries the model id in the query string, so
+	// the evidence for a "switched model and it says it does not exist" report is in these
+	// responses.
 	if os.Getenv("CLAUDE_RC_PROXY_DUMP_BOOTSTRAP") == "1" {
 		dir := os.ExpandEnv("$HOME/.local/state/claude-rc-proxy/bootstrap-dumps")
 		if os.MkdirAll(dir, 0o755) == nil {
@@ -622,10 +644,10 @@ func injectPoolModels(resp *http.Response) error {
 	}
 	var body map[string]any
 	if json.Unmarshal(raw, &body) != nil {
-		// 解不动就原样放行。会走到这里通常意味着响应还是压缩的 ——
-		// Director 里对 bootstrap 删 Accept-Encoding 就是为了避免这种情况,
-		// 所以这里额外记一笔,免得又静默失效一次(第一版就是这么栽的)。
-		log.Printf("WARN   bootstrap 响应解不动(%d 字节, content-encoding=%q),未注入模型",
+		// Forward it unchanged if it cannot be decoded. Getting here usually means the response
+		// is still compressed. Deleting Accept-Encoding for bootstrap in the Director exists to
+		// prevent exactly that, so log it rather than fail silently again as the first version did.
+		log.Printf("WARN   could not decode the bootstrap response (%d bytes, content-encoding=%q); no models injected",
 			len(raw), resp.Header.Get("Content-Encoding"))
 		resp.Body = io.NopCloser(bytes.NewReader(raw))
 		return nil
@@ -646,7 +668,7 @@ func injectPoolModels(resp *http.Response) error {
 		}
 		opts = append(opts, map[string]any{
 			"model": id, "name": id,
-			"description": "via CLIProxyAPI 轮换池", "disabled_reason": nil,
+			"description": "via gateway", "disabled_reason": nil,
 		})
 		added++
 	}
@@ -659,12 +681,12 @@ func injectPoolModels(resp *http.Response) error {
 	resp.Body = io.NopCloser(bytes.NewReader(out))
 	resp.ContentLength = int64(len(out))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(out)))
-	resp.Header.Del("Content-Encoding") // 我们写的是明文 JSON
-	log.Printf("INJECT bootstrap +%d 个池内模型 (共 %d)", added, len(opts))
+	resp.Header.Del("Content-Encoding") // what we write is plaintext JSON
+	log.Printf("INJECT bootstrap +%d gateway models (%d total)", added, len(opts))
 	return nil
 }
 
-// ──────────────────────── 代理入口 ────────────────────────
+// ──────────────────────── Proxy entry point ────────────────────────
 
 type proxy struct {
 	minter *certMinter
@@ -672,8 +694,8 @@ type proxy struct {
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 明文 /healthz 只给本机 watchdog 用。Claude Code 走 CONNECT,不会打到这里。
-	// 必须在分流之前拦下来:否则旧逻辑会把它当控制面转给 api.anthropic.com。
+	// Plaintext /healthz is for the local watchdog only. Claude Code uses CONNECT and never
+	// reaches it. It has to be caught before routing, or it gets forwarded to Anthropic.
 	if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
@@ -684,7 +706,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleConnect(w, r)
 		return
 	}
-	// 明文 HTTP 走代理(少见)。同样按路径分流。
+	// Plaintext HTTP through the proxy, which is rare. Same split by path.
 	p.rp.ServeHTTP(w, r)
 }
 
@@ -696,7 +718,7 @@ func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "hijack 不支持", http.StatusInternalServerError)
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 	clientConn, _, err := hj.Hijack()
@@ -706,7 +728,7 @@ func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	defer clientConn.Close()
 
 	if host != anthropicHost {
-		// 我们既不看也不改这些流量,解 TLS 纯属浪费 —— 裸隧道对拷。
+		// This traffic is neither read nor modified, so decrypting it is pure waste. Raw tunnel.
 		p.tunnel(clientConn, r.Host)
 		return
 	}
@@ -717,26 +739,26 @@ func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	cert, err := p.minter.get(host)
 	if err != nil {
-		log.Printf("ERR    签证书失败 %s: %v", host, err)
+		log.Printf("ERR    failed to mint a certificate for %s: %v", host, err)
 		return
 	}
 	tlsConn := tls.Server(clientConn, &tls.Config{
 		Certificates: []tls.Certificate{*cert},
-		// 只宣告 http/1.1:客户端会自动降级,功能不受影响,
-		// 换来少一整类 h2 + 流式的坑。对上游仍然走 h2。
+		// Offer http/1.1 only. The client downgrades on its own with no loss of function, and
+		// it removes a whole class of h2-plus-streaming problems. The upstream is H1 too.
 		NextProtos: []string{"http/1.1"},
 		MinVersion: tls.VersionTLS12,
 	})
 	if err := tlsConn.Handshake(); err != nil {
-		vlog("TLS    握手失败 %s: %v", host, err)
+		vlog("TLS    handshake failed %s: %v", host, err)
 		return
 	}
 
-	// 用 http.Server 跑这条连接,才能正确处理 keep-alive / chunked / 多请求复用。
+	// Run this connection through http.Server so keep-alive, chunked encoding and multiple
 	srv := &http.Server{
 		Handler:           p.rp,
 		ReadHeaderTimeout: 30 * time.Second,
-		// 不设 WriteTimeout:RC 的 /bridge 长轮询会挂很久,设了会被腰斩。
+		// No WriteTimeout: a Remote Control /bridge long poll hangs for a long time on purpose,
 	}
 	_ = srv.Serve(newOneShotListener(tlsConn, clientConn.RemoteAddr()))
 }
@@ -754,11 +776,11 @@ func (p *proxy) tunnel(client net.Conn, hostPort string) {
 	done := make(chan struct{}, 2)
 	go func() { _, _ = io.Copy(server, client); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(client, server); done <- struct{}{} }()
-	<-done // 任一方向结束就收工,defer 会关掉另一头
+	<-done // either direction finishing ends it; the deferred close takes the other side down
 }
 
-// oneShotListener 把单条已建立的连接包装成 net.Listener,
-// 好让 http.Server 接管它(从而白拿 keep-alive、chunked、并发请求解析)。
+// oneShotListener wraps a single established connection as a net.Listener so that
+// http.Server can take it over, which gives keep-alive, chunked and concurrent parsing free.
 type oneShotListener struct {
 	conn       net.Conn
 	addr       net.Addr
@@ -825,15 +847,15 @@ func truncate(s string, n int) string {
 func main() {
 	initLog()
 	if poolToken == "" {
-		log.Println("WARN   CLAUDE_RC_PROXY_TOKEN 未设置 —— 推理流量会失败,不会静默走订阅额度")
+		log.Println("WARN   CLAUDE_RC_PROXY_TOKEN is not set. Inference will fail rather than quietly use subscription quota")
 	}
 	minter, err := newCertMinter(caPath)
 	if err != nil {
 		log.Fatalf("FATAL  %v", err)
 	}
-	// 预热池内模型列表,避免第一个 bootstrap 请求现拉。
+	// Warm the model list so the first bootstrap request does not have to fetch it.
 	if poolToken != "" {
-		log.Printf("START  监听 %s   池内模型 %d 个   verbose=%v",
+		log.Printf("START  listening on %s   gateway models %d   verbose=%v",
 			listenAddr, len(pool.models_()), verbose)
 	}
 	p := &proxy{minter: minter, rp: newReverseProxy(minter)}
@@ -845,5 +867,5 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-// 让编译器别抱怨没用到的 rsa(CA 可能是 RSA,x509 内部按需使用)
+// Keep the compiler quiet about rsa; the CA may be RSA and x509 uses it as needed.
 var _ = rsa.PublicKey{}
