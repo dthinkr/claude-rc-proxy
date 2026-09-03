@@ -203,7 +203,7 @@ cat <<JSON
   "env": {
     "https_proxy": "http://$LISTEN",
     "http_proxy": "http://$LISTEN",
-    "no_proxy": "localhost,127.0.0.1,::1,datadoghq.com,waditu.com,statsig.com,sentry.io",
+    "no_proxy": "localhost,127.0.0.1,::1,datadoghq.com,statsig.com,sentry.io",
     "NODE_EXTRA_CA_CERTS": "$CA_CERT"
   }
 }

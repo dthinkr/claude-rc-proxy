@@ -82,7 +82,7 @@ expanded. The printed block has that done for you.
   "env": {
     "https_proxy": "http://127.0.0.1:9801",
     "http_proxy": "http://127.0.0.1:9801",
-    "no_proxy": "localhost,127.0.0.1,::1,datadoghq.com,waditu.com,statsig.com,sentry.io",
+    "no_proxy": "localhost,127.0.0.1,::1,datadoghq.com,statsig.com,sentry.io",
     "NODE_EXTRA_CA_CERTS": "/Users/you/.mitmproxy/mitmproxy-ca-cert.pem"
   }
 }
