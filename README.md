@@ -19,7 +19,7 @@ each one will break. macOS only. There is no Linux or Windows path and there wil
 | I left a huge session overnight and the first message next morning cost a fortune. | [`auto-compact`](tools/auto-compact/) | Every VS Code Claude Code session launches through a file in this checkout. | Your account is on the 5-minute cache tier, your sessions stay small, or you work in a terminal. |
 | I want inference from a local gateway, but pointing `ANTHROPIC_BASE_URL` at it kills Remote Control and Artifact publishing. | [`rc-proxy`](tools/rc-proxy/) | Every Claude Code session on the machine goes through one local process that terminates your TLS. | You do not route inference anywhere other than Anthropic. This is the whole reason it exists. |
 
-They share no code and no state. Install one and ignore the other two.
+They share three small shell libraries under `lib/` and one state root, `~/.local/state/ccw`, and nothing else. Install one and ignore the other two.
 
 ---
 

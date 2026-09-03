@@ -140,6 +140,12 @@ def main():
                 break
         stop.set()
         with lock:
+            # Set the flag inside the same lock that guards the write, and set it before
+            # the close. A socket client that arrives between the close and the flag
+            # would otherwise write to a descriptor number the kernel may already have
+            # handed to an unrelated open, which is the failure the flag exists to stop.
+            nonlocal closed
+            closed = True
             try:
                 os.close(w_fd)
             except OSError:

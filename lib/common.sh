@@ -13,8 +13,12 @@
 
 CCW_STATE_ROOT="${CCW_STATE_ROOT:-$HOME/.local/state/ccw}"
 CCW_CONFIG_ROOT="${CCW_CONFIG_ROOT:-$HOME/.config/ccw}"
-CCW_LABEL_PREFIX="io.github.dthinkr.ccw"
 CCW_ASSUME_YES="${CCW_ASSUME_YES:-0}"
+
+# Read by cc-kit and lib/launchd.sh after they source this file. shellcheck analyzes each
+# file on its own and cannot follow that, so it reports this one as unused.
+# shellcheck disable=SC2034
+CCW_LABEL_PREFIX="io.github.dthinkr.ccw"
 
 # ---------------------------------------------------------------- output ----
 
@@ -251,14 +255,20 @@ vscode_user_dirs() {
 # the extension and nobody here has tested against it.
 claude_ext_dirs() {
   local root d found=0
-  for root in "$HOME/.vscode" "$HOME/.vscode-insiders"; do
-    [ -d "$root/extensions" ] || continue
-    for d in "$root"/extensions/anthropic.claude-code-*/; do
-      [ -f "$d/extension.js" ] || continue
-      found=1
-      printf '%s\n' "${d%/}"
+  {
+    for root in "$HOME/.vscode" "$HOME/.vscode-insiders"; do
+      [ -d "$root/extensions" ] || continue
+      for d in "$root"/extensions/anthropic.claude-code-*/; do
+        [ -f "$d/extension.js" ] || continue
+        found=1
+        # Version first so the sort below orders across both editors rather than
+        # listing all of stable and then all of Insiders. Sorting per directory left
+        # an older Insiders build looking newer than current stable, and every caller
+        # that takes the last line would have picked the wrong bundle.
+        printf '%s\t%s\n' "$(basename "${d%/}" | sed 's/^anthropic\.claude-code-//')" "${d%/}"
+      done
     done
-  done
+  } | sort -V | cut -f2-
   [ "$found" = 1 ]
 }
 

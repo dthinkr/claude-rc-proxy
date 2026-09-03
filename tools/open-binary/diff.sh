@@ -126,8 +126,15 @@ elif grep -q "OPEN-BINARY-FALLBACK-PATCH" "$JS" 2>/dev/null; then
   ALREADY=1
 fi
 
-TMP="$(mktemp -t ccw-open-binary)"
-trap 'rm -f "$TMP"' EXIT INT TERM
+# The copy has to be named *.js. `mktemp -t ccw-open-binary` produces a name ending in a
+# random suffix after a dot, and node reads that as an unknown file extension and refuses
+# to parse the file at all: ERR_UNKNOWN_FILE_EXTENSION. patch.sh then saw node --check
+# fail and rolled back, so this command reported a failure on every run against a bundle
+# that patches perfectly well. A temp directory with a fixed filename inside it avoids the
+# whole question.
+TMPD="$(mktemp -d -t ccw-open-binary)"
+TMP="$TMPD/extension.js"
+trap 'rm -rf "$TMPD"' EXIT INT TERM
 cp "$SRC" "$TMP"
 
 head1 "Bundle"
@@ -152,7 +159,24 @@ printf '\n'
 
 head1 "Patching a temp copy"
 say "  $TMP"
+# patch.sh exits 3 when the anchor does not match, which is the single most useful thing
+# this command can tell you. Under set -e that exit killed diff.sh before it printed
+# anything, so a reader trying to find out whether the patch still applies got silence.
+set +e
 "$CCW_ROOT/tools/open-binary/patch.sh" --file "$TMP" "${PATCH_ARGS[@]}"
+patch_rc=$?
+set -e
+if [ "$patch_rc" = 3 ]; then
+  printf '\n'
+  say "The anchor did not match, so there is nothing to show and nothing to install."
+  say "That means the openFile handler in your installed bundle is not the shape this"
+  say "patch expects. Either the extension changed, or you are on a build this has not"
+  say "been tested against. Open an issue with your extension version."
+  exit 3
+elif [ "$patch_rc" != 0 ]; then
+  printf '\n'
+  die "patch.sh exited $patch_rc against a temp copy. Nothing on your machine changed."
+fi
 printf '\n'
 
 head1 "openFile after"

@@ -38,7 +38,9 @@ jobs:
         run: |
           python3 - <<'PY'
           import re, subprocess, sys
-          pat = re.compile(r'[　-〿一-鿿＀-￯]')
+          # Built from code points rather than written out, so this file does not trip
+          # its own check. CJK symbols and punctuation, unified ideographs, fullwidth forms.
+          pat = re.compile('[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]')
           bad = []
           for f in subprocess.run(['git', 'ls-files'], capture_output=True, text=True).stdout.split():
               try:

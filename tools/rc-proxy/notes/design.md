@@ -40,7 +40,7 @@ interception framework and there is much less that can go wrong.
 **Toward the client**, the ALPN list advertises only `http/1.1`. Claude Code downgrades on its own
 and loses no functionality. That removes a whole class of h2-plus-streaming edge cases.
 
-**Toward Anthropic**, `ForceAttemptHTTP2` is set false (`main.go:502`). It used to be true, to save
+**Toward Anthropic**, `ForceAttemptHTTP2` is set false, in the reverse proxy's `Transport`. It used to be true, to save
 connections. The result was that RC long polls, heartbeats and log uploads from dozens of sessions
 multiplexed onto a handful of H2 connections to Anthropic, so one `INTERNAL_ERROR` from the far end
 timed all of them out together. Measured on 2026-08-25: 383 H2 `INTERNAL_ERROR`s within one process
