@@ -6,7 +6,7 @@ people have patched this extension for other reasons, and
 [docs/prior-art.md](docs/prior-art.md) names them and says what is actually new here. Each
 tool edits or intercepts software I do not control, so any of them can stop working on a
 release I did not see coming. Read
-[What breaks, and when](README.md#what-breaks-and-when) before you install anything.
+[What breaks](README.md#what-breaks) before you install anything.
 
 macOS only. There is no Linux or Windows version and there will not be one. The
 installers use launchd and macOS paths throughout.

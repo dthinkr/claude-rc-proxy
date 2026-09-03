@@ -15,7 +15,7 @@ For how to read the shipped binary at all, plus cache tiers and the session regi
 
 ## The mechanism that works
 
-Summarized in the [README](README.md#how-it-works). The two pieces of evidence behind it:
+Summarized in [How it works](README.md#how-it-works). The two pieces of evidence behind it:
 
 A user message arriving on the stream-json channel has no `origin` field, and the classifier reads
 a missing origin as human. **[binary]**
@@ -290,7 +290,7 @@ Over 1,179 sessions and 302,213 turns:
 - Spend is concentrated enough to explain that shape on its own. Top 5 sessions were 51% of spend,
   top 25 were 82%, and a single 38,627-turn session was a third of the month.
 
-The three remaining biases are listed in the [README](README.md#three-known-biases).
+The three remaining biases are listed under [Caveats](README.md#caveats).
 
 One non-finding worth recording: the dip at 600k in the swept curve is not real. Compacting earlier
 changes which later windows still clear the threshold, and at high thresholds there are too few
