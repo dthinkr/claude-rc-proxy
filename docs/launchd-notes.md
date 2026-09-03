@@ -49,10 +49,12 @@ launchctl print gui/$(id -u)/io.github.dthinkr.ccw.open-binary | grep -E 'state|
 was written on there were three agents watching that one directory, and two of them patch
 the same file, `webview/index.css`.
 
-Both of those two wrote their backup to the same fixed name, `index.css.bak`, each guarded
-by `[ -f "$CSS.bak" ] || cp`. Whichever ran second backed up a file the first had already
-patched. Restoring that one backup silently reverted both patches. Nothing broke, because
-each script re-applies itself on the next event, but the backup was worthless.
+Both of those two write their backup to the same fixed name, `index.css.bak`, each guarded
+by `[ -f "$CSS.bak" ] || cp`. The guard means the second one to run does not overwrite the
+first one's backup, so the file does hold a clean original. What it does not hold is a
+per-patch restore point. Restoring it reverts both patches at once, and the tool you were
+trying to undo has no idea the other one just disappeared. One of those two scripts says
+so in its own header comment.
 
 Two rules came out of that, and this repo follows both:
 
