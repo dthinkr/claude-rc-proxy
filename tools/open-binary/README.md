@@ -323,15 +323,12 @@ matched across 2.1.257, 2.1.258 and 2.1.259.
 
 ## The launchd PATH gotcha
 
-launchd runs jobs with a PATH that does not include `/opt/homebrew/bin`. The script called `node`
-bare, so `node --check` failed with command-not-found, so the safety net restored the backup on every
-single agent run. Restoring the backup also removes the marker, so the next filesystem event
-triggered a fresh patch, which failed the same way. By hand, in a login shell, it worked every time.
-
-From the real log on 2026-09-03, translated from the original Chinese:
+Worth one look because the symptom is "it works when I install it and is gone by morning". launchd
+runs jobs without `/opt/homebrew/bin` on PATH, so a bare `node` was not found, `node --check`
+failed, and the safety net restored the backup on every agent run. From the log:
 
 ```
-00:26:34  OK    patched   .../anthropic.claude-code-2.1.257-darwin-arm64/extension.js
+00:26:34  OK    patched
 00:27:06  FAIL  node --check failed, rolled back
 00:27:16  FAIL  node --check failed, rolled back
 00:27:27  FAIL  node --check failed, rolled back
@@ -339,10 +336,8 @@ From the real log on 2026-09-03, translated from the original Chinese:
 00:29:06  OK    patched
 ```
 
-Four failures in 31 seconds, then an OK once the script resolved `node` by absolute path. `patch.sh`
-now tries `/opt/homebrew/bin/node`, then `/usr/local/bin/node`, then whatever `command -v node`
-finds. `./cc-kit doctor` prints the path it resolved. Resolve every interpreter by absolute path in
-anything launchd runs.
+Four failures in 31 seconds, then an OK once `node` was resolved by absolute path. Details and the
+other launchd traps are in [docs/launchd-notes.md](../../docs/launchd-notes.md).
 
 ## The click log
 
@@ -456,14 +451,11 @@ In order of likelihood:
 
 ## Credit
 
-The cause was not discovered here. The symptom is reported in at least eight upstream issues, and
+I did not discover the cause.
 [anthropics/claude-code#37989](https://github.com/anthropics/claude-code/issues/37989), filed
-2026-03-23, already guessed the mechanism ("likely routes through
-`vscode.workspace.openTextDocument` which silently fails for binary files") and already named the fix
-("should go through `vscode.commands.executeCommand('vscode.open', uri)`"). That guess was right.
-Credit for both belongs there.
+2026-03-23, guessed the mechanism and named this exact fix, and the guess was right. Credit belongs
+there.
 
-What this directory adds: the guess confirmed against the shipped bundle, the NUL rule and the
-512-byte window read out of the VS Code build, the webview allowlist defect documented above, and a
-patch that survives extension upgrades. See [docs/prior-art.md](../../docs/prior-art.md) for the other
-tools that patch this extension and what differs here.
+What this adds: the guess confirmed against the shipped bundle, the NUL rule and its 512-byte
+window, the webview defect above, and a patch that survives upgrades.
+[docs/prior-art.md](../../docs/prior-art.md) has the full accounting.
