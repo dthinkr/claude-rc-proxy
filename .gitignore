@@ -1,3 +1,14 @@
-# 编译产物(go build 默认按模块名输出)
-/claude-rc-proxy
-/claude-rc-proxy-go
+# Go build output. Named after the module, and after the move it lands in
+# tools/rc-proxy/ rather than at the root, so these are not anchored.
+claude-rc-proxy
+claude-rc-proxy-go
+
+# Python
+__pycache__/
+*.pyc
+
+# Local backups made by the patch scripts. Never commit one.
+*.bak
+*.bak-*
+
+.DS_Store
